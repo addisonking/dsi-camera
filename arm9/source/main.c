@@ -152,7 +152,9 @@ int main(int argc, char **argv) {
 			// Encode the full photo to memory so we can splice the APP1
 			// segment in right after the SOI marker.
 			MemBuf mainBuf = {0};
-			stbi_write_jpg_to_func(memBufWrite, &mainBuf, 640, 480, 3, rgb, 90);
+			// quality > 90 avoids stb's 4:2:0 chroma subsampling (the DSi's JPEG
+			// decoder appears to reject 4:2:0; 4:4:4 is the safest baseline mode).
+			stbi_write_jpg_to_func(memBufWrite, &mainBuf, 640, 480, 3, rgb, 95);
 			free(rgb);
 
 			FILE *f = fopen(imgName, "wb");

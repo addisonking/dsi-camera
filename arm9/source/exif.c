@@ -50,7 +50,7 @@ void buildExifApp1(u8 *rgb640x480, u8 **outBuf, int *outLen) {
 	}
 
 	MemBuf thumbBuf = {0};
-	stbi_write_jpg_to_func(memBufWrite, &thumbBuf, tw, th, 3, thumbRgb, 70);
+	stbi_write_jpg_to_func(memBufWrite, &thumbBuf, tw, th, 3, thumbRgb, 95);
 	free(thumbRgb);
 
 	// 2. Date/time string (falls back if the DSi RTC hasn't been synced by newlib)
