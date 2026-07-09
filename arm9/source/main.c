@@ -74,12 +74,24 @@ void captureAndSave(u16 *previewGfx) {
 	cameraTransferStop();
 
 	// Show the frame we just grabbed (nearest-neighbour 640x480 -> 256x192) so
-	// the preview isn't frozen while we encode/sign during a burst.
+	// the preview isn't frozen while we encode/sign during a burst. Capture
+	// mode outputs raw YUV422, so convert to RGB555 here (the live preview uses
+	// the camera's hardware YUV->RGB555, but capture bypasses it).
 	if(previewGfx) {
 		for(int y = 0; y < 192; y++) {
 			int sy = (y * 480) / 192;
-			for(int x = 0; x < 256; x++)
-				previewGfx[y * 256 + x] = yuv[sy * 640 + (x * 640) / 256];
+			for(int x = 0; x < 256; x++) {
+				int sx = (x * 640) / 256 & ~1; // keep YUV pair alignment
+				u8 *val = (u8 *)(yuv + sy * 640 + sx);
+				int Y = val[(x & 1) ? 2 : 0];
+				int Cb = val[1] - 0x80;
+				int Cr = val[3] - 0x80;
+				int r = YUV_TO_R(Y, Cr) >> 3;
+				int g = YUV_TO_G(Y, Cb, Cr) >> 3;
+				int b = YUV_TO_B(Y, Cb) >> 3;
+				// NDS 16-bit bitmap is aBBBBBGGGGGRRRRR (blue high, red low)
+				previewGfx[y * 256 + x] = BIT(15) | (b << 10) | (g << 5) | r;
+			}
 		}
 	}
 
