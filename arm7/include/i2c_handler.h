@@ -12,6 +12,9 @@ extern "C" {
 extern Thread s_i2cPxiThread;
 extern u8 s_i2cPxiThreadStack[1024];
 
+// 16-byte DSi camera signing key, captured from WRAM at boot (see arm7 main).
+extern u32 g_cameraKey[4];
+
 int i2cPxiThreadMain(void* arg);
 
 #ifdef __cplusplus

@@ -54,6 +54,17 @@ int i2cPxiThreadMain(void* arg) {
 				setMode(CAPTURE_MODE_CAPTURE);
 				retval = CAPTURE_MODE_CAPTURE;
 				break;
+			case CAM_GET_KEY0:
+			case CAM_GET_KEY1:
+			case CAM_GET_KEY2:
+			case CAM_GET_KEY3:
+			case CAM_GET_KEY4:
+			case CAM_GET_KEY5:
+			case CAM_GET_KEY6:
+			case CAM_GET_KEY7:
+				// 16-bit halfword to stay within PXI's 26-bit immediate.
+				retval = ((u16 *)g_cameraKey)[msg - CAM_GET_KEY0];
+				break;
 			default:
 				break;
 		}

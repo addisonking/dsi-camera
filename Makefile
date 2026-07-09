@@ -13,7 +13,7 @@ export TOPDIR := $(CURDIR)
 NITRO_FILES :=
 
 # These set the information text in the nds file
-GAME_TITLE		:=	DSi camera test
+GAME_TITLE		:=	DSi Camera
 GAME_AUTHOR		:=	Pk11
 
 GAME_ICON		:=	icon.bmp

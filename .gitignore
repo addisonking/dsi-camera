@@ -6,3 +6,16 @@ arm9/include/version.h
 
 *.DS_Store
 .vscode
+
+# dev tool artifacts & sensitive data: camera AES key, real photos,
+# BIOS/pit dumps, and compiled test binaries (never commit these)
+tools/**/*.bin
+tools/**/*.bin.backup
+tools/**/*.backup
+tools/**/*.jpg
+tools/signing/finder
+tools/signing/refsign
+tools/signing/multikey
+tools/signing/test_sign
+tools/signing/test_photo
+tools/pit/pctest

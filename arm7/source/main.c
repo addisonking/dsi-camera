@@ -37,11 +37,21 @@
 
 // #include <calico.h>
 #include <nds.h>
+#include <string.h>
 // #include <maxmod7.h>
+
+// 16-byte DSi camera signing key. The ARM7 BIOS leaves it in WRAM at boot; we
+// grab it before anything else can reuse that memory. Offset located by scanning
+// a BIOS dump for the key that reproduces a real photo's AES-CCM MAC.
+u32 g_cameraKey[4];
+#define CAMERA_KEY_ADDR 0x03FFC5B0
 
 //---------------------------------------------------------------------------------
 int main() {
 //---------------------------------------------------------------------------------
+
+	// Capture the camera signing key from WRAM before touching anything else.
+	memcpy(g_cameraKey, (const void *)CAMERA_KEY_ADDR, 16);
 
 	// Read settings from NVRAM
 	envReadNvramSettings();
