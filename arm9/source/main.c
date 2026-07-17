@@ -315,6 +315,32 @@ static bool exportToAlbum(int num) {
 	return ok;
 }
 
+// Soft delete: photos move to /photos/trash (never erased); pull them off the
+// card or move them back by hand to restore.
+static void softDelete(int num) {
+	char from[40], to[52];
+	mkdir(RAW_DIR "/trash", 0777);
+	rawPath(from, num);
+	sprintf(to, RAW_DIR "/trash/IMG_%04d.YUV", num);
+	rename(from, to);
+	thumbPath(from, num);
+	sprintf(to, RAW_DIR "/trash/IMG_%04d.THM", num);
+	rename(from, to);
+}
+
+// Waits for A (true) or B (false).
+static bool confirmAB(void) {
+	for(;;) {
+		swiWaitForVBlank();
+		scanKeys();
+		u16 p = keysDown();
+		if(p & KEY_A)
+			return true;
+		if(p & KEY_B || pmShouldReset())
+			return false;
+	}
+}
+
 // Loads (or builds and caches) the 64x48 thumbnail for a photo.
 static void getThumb(int num, u16 *out) {
 	char path[40];
@@ -455,7 +481,8 @@ static void composeAlbum(u16 *gfx,
 						 const int *px,
 						 const int *py,
 						 int scroll,
-						 int sel) {
+						 int sel,
+						 const bool *marked) {
 	u16 bgCol = BIT(15) | RGB15(3, 3, 4);
 	for(int i = 0; i < 256 * SCREEN_H; i++)
 		gfx[i] = bgCol;
@@ -477,8 +504,31 @@ static void composeAlbum(u16 *gfx,
 		}
 	}
 
-	// Selection border
-	u16 white = BIT(15) | RGB15(31, 31, 31);
+	// Marked photos get an orange border.
+	u16 orange = BIT(15) | RGB15(31, 20, 4);
+	for(int i = 0; i < count; i++) {
+		if(!marked || !marked[i] || i == sel)
+			continue;
+		int my = py[i] - scroll;
+		if(my <= -THUMB_H || my >= SCREEN_H)
+			continue;
+		hline(gfx, px[i], my, THUMB_W, orange);
+		hline(gfx, px[i], my + 1, THUMB_W, orange);
+		hline(gfx, px[i], my + THUMB_H - 2, THUMB_W, orange);
+		hline(gfx, px[i], my + THUMB_H - 1, THUMB_W, orange);
+		for(int y = 0; y < THUMB_H; y++) {
+			int yy = my + y;
+			if(yy < 0 || yy >= SCREEN_H)
+				continue;
+			gfx[yy * 256 + px[i]]               = orange;
+			gfx[yy * 256 + px[i] + 1]           = orange;
+			gfx[yy * 256 + px[i] + THUMB_W - 2] = orange;
+			gfx[yy * 256 + px[i] + THUMB_W - 1] = orange;
+		}
+	}
+
+	// Selection border (orange instead of white when the photo is marked).
+	u16 white = marked && marked[sel] ? orange : (BIT(15) | RGB15(31, 31, 31));
 	int dy    = py[sel] - scroll;
 	hline(gfx, px[sel], dy, THUMB_W, white);
 	hline(gfx, px[sel], dy + 1, THUMB_W, white);
@@ -523,10 +573,12 @@ static int moveRow(const int *px, const int *py, int count, int sel, int dir) {
 	return i + (col < len ? col : len);
 }
 
-// Full-screen view of one photo. Returns with *idx possibly changed.
-static void fullView(u16 *gfx, const Photo *ph, int count, int *idx) {
-	u16 *yuv   = (u16 *)malloc(RAW_SIZE);
-	bool dirty = true;
+// Full-screen view of one photo. Returns true if a photo was deleted (the
+// caller must reload its list); *idx may change from browsing.
+static bool fullView(u16 *gfx, const Photo *ph, int count, int *idx) {
+	u16 *yuv     = (u16 *)malloc(RAW_SIZE);
+	bool dirty   = true;
+	bool deleted = false;
 
 	while(!pmShouldReset()) {
 		if(dirty) {
@@ -545,7 +597,8 @@ static void fullView(u16 *gfx, const Photo *ph, int count, int *idx) {
 			else
 				strcpy(when, "unknown date");
 			consoleClear();
-			printf("\n  IMG_%04d  (%d/%d)\n  %s\n\n  <>: browse    B: album\n  A: send to DSi album\n",
+			printf("\n  IMG_%04d  (%d/%d)\n  %s\n\n  <>: browse    B: album\n  A: send to DSi album\n"
+				   "  X: delete\n",
 				   ph[*idx].num,
 				   *idx + 1,
 				   count,
@@ -566,123 +619,173 @@ static void fullView(u16 *gfx, const Photo *ph, int count, int *idx) {
 		} else if(pressed & KEY_A) {
 			printf("\n  Exporting (takes a bit)...\n");
 			printf(exportToAlbum(ph[*idx].num) ? "  Done!\n" : "  Export failed!\n");
+		} else if(pressed & KEY_X) {
+			printf("\n  Delete IMG_%04d?\n  A: delete     B: keep\n", ph[*idx].num);
+			if(confirmAB()) {
+				softDelete(ph[*idx].num);
+				deleted = true;
+				break;
+			}
+			dirty = true;
 		} else if(pressed & (KEY_B | KEY_SELECT | KEY_START)) {
 			break;
 		}
 	}
 
 	free(yuv);
+	return deleted;
 }
 
-// The album: a grid of thumbnails. D-pad: move, L/R: page, A: full view,
-// B/SELECT: back to the camera.
+// The album: a scrolling gallery. D-pad: move, L/R: day, A: full view,
+// Y: mark, X: delete (marked photos, or the selected one), B/SELECT: back.
 static void viewer(u16 *gfx) {
-	Photo *ph;
-	int count = scanRaw(&ph);
-	if(count == 0) {
-		printf("No photos yet.\n");
-		free(ph);
-		return;
-	}
-
-	int *px = (int *)malloc(count * sizeof(int));
-	int *py = (int *)malloc(count * sizeof(int));
-	Section *sec;
-	int nsec;
-	int virtH     = buildLayout(ph, count, px, py, &sec, &nsec);
-	int maxScroll = virtH - SCREEN_H;
-	if(maxScroll < 0)
-		maxScroll = 0;
-
-	// Cache every thumbnail in RAM (~6KB each) so scrolling never hits the SD.
-	u16 *thumbs = (u16 *)malloc(count * THUMB_W * THUMB_H * sizeof(u16));
-	consoleClear();
-	printf("\n  Loading album...\n");
-	for(int i = 0; i < count; i++)
-		getThumb(ph[i].num, thumbs + i * THUMB_W * THUMB_H);
-
-	int sel    = count - 1; // start on the newest photo
-	int scroll = maxScroll, target = maxScroll;
-	bool dirty = true, infoDirty = true;
-
 	keysSetRepeat(14, 4); // hold d-pad to keep moving
+	bool quit = false;
+	int sel   = -1; // -1 = newest; preserved across reloads after a delete
 
-	while(!pmShouldReset()) {
-		swiWaitForVBlank();
-		scanKeys();
-		u16 pressed = keysDownRepeat();
-
-		int prevSel = sel;
-		if(pressed & KEY_LEFT)
-			sel--;
-		else if(pressed & KEY_RIGHT)
-			sel++;
-		else if(pressed & KEY_UP)
-			sel = moveRow(px, py, count, sel, -1);
-		else if(pressed & KEY_DOWN)
-			sel = moveRow(px, py, count, sel, 1);
-		else if(pressed & (KEY_L | KEY_R)) {
-			// Jump to the previous/next day.
-			int s = 0;
-			while(s + 1 < nsec && sec[s + 1].start <= sel)
-				s++;
-			s += (pressed & KEY_L) ? -1 : 1;
-			if(s < 0)
-				s = 0;
-			if(s >= nsec)
-				s = nsec - 1;
-			sel = sec[s].start;
-		}
-		if(sel < 0)
-			sel = 0;
-		if(sel >= count)
-			sel = count - 1;
-		if(sel != prevSel)
-			infoDirty = true;
-
-		u16 tapped = keysDown();
-		if(tapped & KEY_A) {
-			fullView(gfx, ph, count, &sel);
-			dirty     = true;
-			infoDirty = true;
-		} else if(tapped & (KEY_B | KEY_SELECT)) {
+	while(!quit) {
+		Photo *ph;
+		int count = scanRaw(&ph);
+		if(count == 0) {
+			printf("No photos yet.\n");
+			free(ph);
 			break;
 		}
+		if(sel < 0 || sel >= count)
+			sel = count - 1;
 
-		// Keep the selection (and its day header) on screen; ease toward it.
-		if(py[sel] - HEADER_H < target)
-			target = py[sel] - HEADER_H;
-		if(py[sel] + THUMB_H + 4 - SCREEN_H > target)
-			target = py[sel] + THUMB_H + 4 - SCREEN_H;
-		if(target < 0)
-			target = 0;
-		if(target > maxScroll)
-			target = maxScroll;
+		int *px      = (int *)malloc(count * sizeof(int));
+		int *py      = (int *)malloc(count * sizeof(int));
+		bool *marked = (bool *)calloc(count, sizeof(bool));
+		Section *sec;
+		int nsec;
+		int virtH     = buildLayout(ph, count, px, py, &sec, &nsec);
+		int maxScroll = virtH - SCREEN_H;
+		if(maxScroll < 0)
+			maxScroll = 0;
 
-		if(scroll != target) {
-			int d = target - scroll;
-			scroll += d / 3 + (d > 0 ? 1 : -1);
-			dirty = true;
+		// Cache every thumbnail in RAM (~6KB each) so scrolling never hits the SD.
+		u16 *thumbs = (u16 *)malloc(count * THUMB_W * THUMB_H * sizeof(u16));
+		consoleClear();
+		printf("\n  Loading album...\n");
+		for(int i = 0; i < count; i++)
+			getThumb(ph[i].num, thumbs + i * THUMB_W * THUMB_H);
+
+		int scroll = maxScroll, target = maxScroll;
+		bool dirty = true, infoDirty = true, reload = false;
+
+		while(!reload && !pmShouldReset()) {
+			swiWaitForVBlank();
+			scanKeys();
+			u16 pressed = keysDownRepeat();
+
+			int prevSel = sel;
+			if(pressed & KEY_LEFT)
+				sel--;
+			else if(pressed & KEY_RIGHT)
+				sel++;
+			else if(pressed & KEY_UP)
+				sel = moveRow(px, py, count, sel, -1);
+			else if(pressed & KEY_DOWN)
+				sel = moveRow(px, py, count, sel, 1);
+			else if(pressed & (KEY_L | KEY_R)) {
+				// Jump to the previous/next day.
+				int s = 0;
+				while(s + 1 < nsec && sec[s + 1].start <= sel)
+					s++;
+				s += (pressed & KEY_L) ? -1 : 1;
+				if(s < 0)
+					s = 0;
+				if(s >= nsec)
+					s = nsec - 1;
+				sel = sec[s].start;
+			}
+			if(sel < 0)
+				sel = 0;
+			if(sel >= count)
+				sel = count - 1;
+			if(sel != prevSel)
+				infoDirty = true;
+
+			u16 tapped = keysDown();
+			if(tapped & KEY_A) {
+				reload    = fullView(gfx, ph, count, &sel);
+				dirty     = true;
+				infoDirty = true;
+			} else if(tapped & KEY_Y) {
+				marked[sel] = !marked[sel];
+				dirty       = true;
+				infoDirty   = true;
+			} else if(tapped & KEY_X) {
+				int nMarked = 0;
+				for(int i = 0; i < count; i++)
+					nMarked += marked[i];
+				consoleClear();
+				if(nMarked)
+					printf("\n  Delete %d marked photo(s)?\n  A: delete     B: cancel\n", nMarked);
+				else
+					printf("\n  Delete IMG_%04d?\n  A: delete     B: cancel\n", ph[sel].num);
+				if(confirmAB()) {
+					if(nMarked) {
+						for(int i = 0; i < count; i++)
+							if(marked[i])
+								softDelete(ph[i].num);
+					} else {
+						softDelete(ph[sel].num);
+					}
+					reload = true;
+				}
+				dirty     = true;
+				infoDirty = true;
+			} else if(tapped & (KEY_B | KEY_SELECT)) {
+				quit = true;
+				break;
+			}
+
+			// Keep the selection (and its day header) on screen; ease toward it.
+			if(py[sel] - HEADER_H < target)
+				target = py[sel] - HEADER_H;
+			if(py[sel] + THUMB_H + 4 - SCREEN_H > target)
+				target = py[sel] + THUMB_H + 4 - SCREEN_H;
+			if(target < 0)
+				target = 0;
+			if(target > maxScroll)
+				target = maxScroll;
+
+			if(scroll != target) {
+				int d = target - scroll;
+				scroll += d / 3 + (d > 0 ? 1 : -1);
+				dirty = true;
+			}
+
+			if(dirty || sel != prevSel) {
+				composeAlbum(gfx, count, thumbs, sec, nsec, px, py, scroll, sel, marked);
+				dirty = scroll != target;
+			}
+
+			if(infoDirty) {
+				int nMarked = 0;
+				for(int i = 0; i < count; i++)
+					nMarked += marked[i];
+				consoleClear();
+				printf("\n  IMG_%04d  (%d/%d)%s\n", ph[sel].num, sel + 1, count, marked[sel] ? "  *" : "");
+				if(nMarked)
+					printf("  %d marked\n", nMarked);
+				printf("\n  +: select     L/R: day\n  A: view       Y: mark\n  X: delete     B: camera\n");
+				infoDirty = false;
+			}
 		}
 
-		if(dirty || sel != prevSel) {
-			composeAlbum(gfx, count, thumbs, sec, nsec, px, py, scroll, sel);
-			dirty = scroll != target;
-		}
+		if(pmShouldReset())
+			quit = true;
+		free(thumbs);
+		free(marked);
+		free(sec);
+		free(py);
+		free(px);
+		free(ph);
+	} // reload loop
 
-		if(infoDirty) {
-			consoleClear();
-			printf("\n  IMG_%04d  (%d/%d)\n", ph[sel].num, sel + 1, count);
-			printf("\n  +: select     L/R: day\n  A: view       B: camera\n");
-			infoDirty = false;
-		}
-	}
-
-	free(thumbs);
-	free(sec);
-	free(py);
-	free(px);
-	free(ph);
 	consoleClear();
 	printf("dsi-camera " VER_NUMBER "\n\nA: swap camera\nHold L/R: take photos\nSELECT: album\nSTART or POWER: exit\n");
 }
@@ -705,6 +808,20 @@ int main(int argc, char **argv) {
 			if(ph[i].num >= s_nextRawNum)
 				s_nextRawNum = ph[i].num + 1;
 		free(ph);
+		// Numbers of soft-deleted photos stay reserved so a fresh photo can't
+		// collide with one already in the trash.
+		DIR *tdir = opendir(RAW_DIR "/trash");
+		if(tdir) {
+			struct dirent *pent;
+			while((pent = readdir(tdir))) {
+				if(strncmp(pent->d_name, "IMG_", 4) != 0)
+					continue;
+				int val = atoi(pent->d_name + 4);
+				if(val >= s_nextRawNum)
+					s_nextRawNum = val + 1;
+			}
+			closedir(tdir);
+		}
 	} else {
 		printf("FAT init failed, photos cannot\nbe saved.\n");
 	}
