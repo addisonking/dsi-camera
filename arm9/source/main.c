@@ -34,6 +34,9 @@
 
 int clamp(int val, int min, int max) { return val < min ? min : (val > max ? max : val); }
 
+static u16 *s_subGfx; // bottom-screen bitmap, drawn by the ui* helpers
+static void uiStatus(const char *s);
+
 // Draws a raw 640x480 YUV422 frame downscaled (nearest-neighbour) to a
 // dw x dh RGB555 image in `dst` with row stride `stride`.
 static void blitYuvScaled(const u16 *yuv, u16 *dst, int stride, int dw, int dh) {
@@ -161,13 +164,15 @@ static int workerMain(void *arg) {
 		char path[40];
 		rawPath(path, job->num);
 		FILE *f = fopen(path, "wb");
+		char msg[32];
 		if(f) {
 			fwrite(job->yuv, 1, RAW_SIZE, f);
 			fclose(f);
-			printf("Saved IMG_%04d\n", job->num);
+			sprintf(msg, "SAVED IMG_%04d", job->num);
 		} else {
-			printf("Write failed: %s\n", path);
+			sprintf(msg, "SAVE FAILED: IMG_%04d", job->num);
 		}
+		uiStatus(msg);
 
 		// Thumbnail cache for the album grid.
 		u16 thumb[THUMB_W * THUMB_H];
@@ -190,7 +195,7 @@ static int workerMain(void *arg) {
 // sleeping, or opening the viewer so the photo list is complete.
 static void drainJobs(void) {
 	if(JOBS_PENDING)
-		printf("Finishing %lu photo(s)...\n", (unsigned long)JOBS_PENDING);
+		uiStatus("SAVING...");
 	while(JOBS_PENDING)
 		swiWaitForVBlank();
 }
@@ -310,8 +315,6 @@ static bool exportToAlbum(int num) {
 	}
 	free(photo);
 
-	if(ok)
-		printf("Exported to %s\n", jpgName);
 	return ok;
 }
 
@@ -382,7 +385,7 @@ static void getThumb(int num, u16 *out) {
 
 // 5x7 pixel font (columns, LSB = top row) for the date headers; covers
 // uppercase, digits, comma and space.
-static const u8 s_font[38][5] = {
+static const u8 s_font[46][5] = {
 	{0x7E, 0x11, 0x11, 0x11, 0x7E}, {0x7F, 0x49, 0x49, 0x49, 0x36}, {0x3E, 0x41, 0x41, 0x41, 0x22},
 	{0x7F, 0x41, 0x41, 0x22, 0x1C}, {0x7F, 0x49, 0x49, 0x49, 0x41}, {0x7F, 0x09, 0x09, 0x09, 0x01},
 	{0x3E, 0x41, 0x49, 0x49, 0x7A}, {0x7F, 0x08, 0x08, 0x08, 0x7F}, {0x00, 0x41, 0x7F, 0x41, 0x00},
@@ -395,11 +398,35 @@ static const u8 s_font[38][5] = {
 	{0x3E, 0x51, 0x49, 0x45, 0x3E}, {0x00, 0x42, 0x7F, 0x40, 0x00}, {0x42, 0x61, 0x51, 0x49, 0x46},
 	{0x21, 0x41, 0x45, 0x4B, 0x31}, {0x18, 0x14, 0x12, 0x7F, 0x10}, {0x27, 0x45, 0x45, 0x45, 0x39},
 	{0x3C, 0x4A, 0x49, 0x49, 0x30}, {0x01, 0x71, 0x09, 0x05, 0x03}, {0x36, 0x49, 0x49, 0x49, 0x36},
-	{0x06, 0x49, 0x49, 0x29, 0x1E},                                // 0-9
-	{0x00, 0x50, 0x30, 0x00, 0x00}, {0x00, 0x00, 0x00, 0x00, 0x00} // comma, space
+	{0x06, 0x49, 0x49, 0x29, 0x1E},                                 // 0-9
+	{0x00, 0x50, 0x30, 0x00, 0x00}, {0x00, 0x00, 0x00, 0x00, 0x00}, // comma, space
+	{0x02, 0x01, 0x51, 0x09, 0x06}, {0x00, 0x60, 0x60, 0x00, 0x00}, // ? .
+	{0x20, 0x10, 0x08, 0x04, 0x02}, {0x00, 0x36, 0x36, 0x00, 0x00}, // / :
+	{0x08, 0x08, 0x08, 0x08, 0x08}, {0x22, 0x14, 0x7F, 0x14, 0x22}, // - *
+	{0x08, 0x1C, 0x2A, 0x08, 0x08}, {0x08, 0x08, 0x2A, 0x1C, 0x08}  // left/right arrow
 };
 
 static const u8 *glyph(char c) {
+	if(c >= 'a' && c <= 'z')
+		c -= 'a' - 'A';
+	switch(c) {
+		case '?':
+			return s_font[38];
+		case '.':
+			return s_font[39];
+		case '/':
+			return s_font[40];
+		case ':':
+			return s_font[41];
+		case '-':
+			return s_font[42];
+		case '*':
+			return s_font[43];
+		case '<':
+			return s_font[44];
+		case '>':
+			return s_font[45];
+	}
 	if(c >= 'A' && c <= 'Z')
 		return s_font[c - 'A'];
 	if(c >= '0' && c <= '9')
@@ -420,6 +447,86 @@ static void drawText(u16 *gfx, int x, int y, const char *s, u16 col) {
 			}
 		}
 	}
+}
+
+// --- Bottom-screen UI: minimalist monochrome panels drawn with the pixel
+// --- font instead of a scrolling console.
+
+#define UI_BG (BIT(15) | RGB15(3, 3, 4))
+#define UI_FG (BIT(15) | RGB15(28, 28, 29))
+#define UI_DIM (BIT(15) | RGB15(13, 13, 15))
+
+static void uiRect(int x, int y, int w, int h, u16 col) {
+	for(int yy = y; yy < y + h; yy++)
+		for(int xx = x; xx < x + w; xx++)
+			s_subGfx[yy * 256 + xx] = col;
+}
+
+static void uiText(int x, int y, const char *s, u16 col) { drawText(s_subGfx, x, y, s, col); }
+
+static void uiTextCenter(int y, const char *s, u16 col) { uiText((256 - (int)strlen(s) * 6) / 2, y, s, col); }
+
+// Double-size text for headers.
+static void uiText2(int x, int y, const char *s, u16 col) {
+	for(; *s; s++, x += 12) {
+		const u8 *g = glyph(*s);
+		for(int cx = 0; cx < 5; cx++) {
+			for(int cy = 0; cy < 7; cy++) {
+				if(!(g[cx] >> cy & 1))
+					continue;
+				int xx = x + cx * 2, yy = y + cy * 2;
+				s_subGfx[yy * 256 + xx]           = col;
+				s_subGfx[yy * 256 + xx + 1]       = col;
+				s_subGfx[(yy + 1) * 256 + xx]     = col;
+				s_subGfx[(yy + 1) * 256 + xx + 1] = col;
+			}
+		}
+	}
+}
+
+// Clears the screen and draws the title bar.
+static void uiHeader(const char *title) {
+	uiRect(0, 0, 256, SCREEN_H, UI_BG);
+	uiText2((256 - (int)strlen(title) * 12) / 2, 12, title, UI_FG);
+	uiRect(24, 34, 208, 1, UI_DIM);
+}
+
+// One-line status at the bottom of the screen (safe to call from the worker
+// thread; it only touches its own strip).
+static void uiStatus(const char *s) {
+	uiRect(0, 178, 256, 14, UI_BG);
+	uiTextCenter(182, s, UI_DIM);
+}
+
+// A right-aligned key hint column and left-aligned action, one row.
+static void uiKey(int y, const char *key, const char *action) {
+	uiText(116 - (int)strlen(key) * 6, y, key, UI_DIM);
+	uiText(126, y, action, UI_FG);
+}
+
+static void uiCameraScreen(int cam, bool fatInited) {
+	uiHeader("DSI CAMERA");
+	uiTextCenter(44, cam == CAM_INNER ? "INNER CAMERA" : "OUTER CAMERA", UI_DIM);
+
+	int y = 76;
+	if(fatInited) {
+		uiKey(y, "L/R", "TAKE PHOTOS");
+		uiKey(y += 16, "A", "SWAP CAMERA");
+		uiKey(y += 16, "SELECT", "ALBUM");
+	} else {
+		uiTextCenter(y, "NO SD CARD - CANT SAVE", UI_FG);
+		uiKey(y += 16, "A", "SWAP CAMERA");
+	}
+	uiKey(y += 16, "START", "EXIT");
+}
+
+// Centered modal question; waits for A (true) / B (false).
+static bool uiConfirm(const char *msg) {
+	uiRect(27, 63, 202, 58, UI_DIM);
+	uiRect(28, 64, 200, 56, UI_BG);
+	uiTextCenter(78, msg, UI_FG);
+	uiTextCenter(100, "A: YES     B: NO", UI_DIM);
+	return confirmAB();
 }
 
 typedef struct Section {
@@ -590,19 +697,22 @@ static bool fullView(u16 *gfx, const Photo *ph, int count, int *idx) {
 				fclose(f);
 				blitYuv(yuv, gfx);
 			}
-			char when[40];
+			char when[40], line[40];
 			struct tm *lt = localtime(&ph[*idx].ts);
 			if(lt)
-				strftime(when, sizeof(when), "%b %d, %Y %H:%M", lt);
+				strftime(when, sizeof(when), "%b %d, %Y  %H:%M", lt);
 			else
-				strcpy(when, "unknown date");
-			consoleClear();
-			printf("\n  IMG_%04d  (%d/%d)\n  %s\n\n  <>: browse    B: album\n  A: send to DSi album\n"
-				   "  X: delete\n",
-				   ph[*idx].num,
-				   *idx + 1,
-				   count,
-				   when);
+				strcpy(when, "UNKNOWN DATE");
+			sprintf(line, "IMG_%04d", ph[*idx].num);
+			uiHeader(line);
+			uiTextCenter(44, when, UI_DIM);
+			sprintf(line, "%d/%d", *idx + 1, count);
+			uiTextCenter(58, line, UI_DIM);
+			int y = 88;
+			uiKey(y, "< >", "BROWSE");
+			uiKey(y += 16, "A", "SEND TO DSI ALBUM");
+			uiKey(y += 16, "X", "DELETE");
+			uiKey(y += 16, "B", "BACK");
 			dirty = false;
 		}
 
@@ -617,11 +727,12 @@ static bool fullView(u16 *gfx, const Photo *ph, int count, int *idx) {
 			*idx  = (*idx + 1) % count;
 			dirty = true;
 		} else if(pressed & KEY_A) {
-			printf("\n  Exporting (takes a bit)...\n");
-			printf(exportToAlbum(ph[*idx].num) ? "  Done!\n" : "  Export failed!\n");
+			uiStatus("EXPORTING...");
+			uiStatus(exportToAlbum(ph[*idx].num) ? "SENT TO DSI ALBUM" : "EXPORT FAILED");
 		} else if(pressed & KEY_X) {
-			printf("\n  Delete IMG_%04d?\n  A: delete     B: keep\n", ph[*idx].num);
-			if(confirmAB()) {
+			char msg[32];
+			sprintf(msg, "DELETE IMG_%04d?", ph[*idx].num);
+			if(uiConfirm(msg)) {
 				softDelete(ph[*idx].num);
 				deleted = true;
 				break;
@@ -638,16 +749,17 @@ static bool fullView(u16 *gfx, const Photo *ph, int count, int *idx) {
 
 // The album: a scrolling gallery. D-pad: move, L/R: day, A: full view,
 // Y: mark, X: delete (marked photos, or the selected one), B/SELECT: back.
-static void viewer(u16 *gfx) {
+static void viewer(u16 *gfx, int cam) {
 	keysSetRepeat(14, 4); // hold d-pad to keep moving
-	bool quit = false;
-	int sel   = -1; // -1 = newest; preserved across reloads after a delete
+	bool quit  = false;
+	bool empty = false;
+	int sel    = -1; // -1 = newest; preserved across reloads after a delete
 
 	while(!quit) {
 		Photo *ph;
 		int count = scanRaw(&ph);
 		if(count == 0) {
-			printf("No photos yet.\n");
+			empty = true;
 			free(ph);
 			break;
 		}
@@ -666,8 +778,8 @@ static void viewer(u16 *gfx) {
 
 		// Cache every thumbnail in RAM (~6KB each) so scrolling never hits the SD.
 		u16 *thumbs = (u16 *)malloc(count * THUMB_W * THUMB_H * sizeof(u16));
-		consoleClear();
-		printf("\n  Loading album...\n");
+		uiHeader("ALBUM");
+		uiStatus("LOADING...");
 		for(int i = 0; i < count; i++)
 			getThumb(ph[i].num, thumbs + i * THUMB_W * THUMB_H);
 
@@ -720,12 +832,12 @@ static void viewer(u16 *gfx) {
 				int nMarked = 0;
 				for(int i = 0; i < count; i++)
 					nMarked += marked[i];
-				consoleClear();
+				char msg[36];
 				if(nMarked)
-					printf("\n  Delete %d marked photo(s)?\n  A: delete     B: cancel\n", nMarked);
+					sprintf(msg, "DELETE %d SELECTED PHOTO%s?", nMarked, nMarked == 1 ? "" : "S");
 				else
-					printf("\n  Delete IMG_%04d?\n  A: delete     B: cancel\n", ph[sel].num);
-				if(confirmAB()) {
+					sprintf(msg, "DELETE IMG_%04d?", ph[sel].num);
+				if(uiConfirm(msg)) {
 					if(nMarked) {
 						for(int i = 0; i < count; i++)
 							if(marked[i])
@@ -767,11 +879,21 @@ static void viewer(u16 *gfx) {
 				int nMarked = 0;
 				for(int i = 0; i < count; i++)
 					nMarked += marked[i];
-				consoleClear();
-				printf("\n  IMG_%04d  (%d/%d)%s\n", ph[sel].num, sel + 1, count, marked[sel] ? "  *" : "");
-				if(nMarked)
-					printf("  %d marked\n", nMarked);
-				printf("\n  +: select     L/R: day\n  A: view       Y: mark\n  X: delete     B: camera\n");
+				char line[36];
+				uiHeader("ALBUM");
+				sprintf(line, "IMG_%04d  %d/%d%s", ph[sel].num, sel + 1, count, marked[sel] ? "  *" : "");
+				uiTextCenter(44, line, UI_FG);
+				if(nMarked) {
+					sprintf(line, "%d SELECTED", nMarked);
+					uiTextCenter(58, line, UI_DIM);
+				}
+				int y = 82;
+				uiKey(y, "+", "NAVIGATE");
+				uiKey(y += 16, "L/R", "JUMP DAY");
+				uiKey(y += 16, "A", "VIEW");
+				uiKey(y += 16, "Y", "SELECT");
+				uiKey(y += 16, "X", "DELETE");
+				uiKey(y += 16, "B", "CAMERA");
 				infoDirty = false;
 			}
 		}
@@ -786,18 +908,23 @@ static void viewer(u16 *gfx) {
 		free(ph);
 	} // reload loop
 
-	consoleClear();
-	printf("dsi-camera " VER_NUMBER "\n\nA: swap camera\nHold L/R: take photos\nSELECT: album\nSTART or POWER: exit\n");
+	uiCameraScreen(cam, true);
+	if(empty)
+		uiStatus("NO PHOTOS YET");
 }
 
 int main(int argc, char **argv) {
-	consoleDemoInit();
 	vramSetBankA(VRAM_A_MAIN_BG);
+	vramSetBankC(VRAM_C_SUB_BG);
 	videoSetMode(MODE_5_2D);
+	videoSetModeSub(MODE_5_2D);
 	int bg3Main = bgInit(3, BgType_Bmp16, BgSize_B16_256x256, 1, 0);
+	int bg3Sub  = bgInitSub(3, BgType_Bmp16, BgSize_B16_256x256, 1, 0);
 	u16 *gfx    = bgGetGfxPtr(bg3Main);
+	s_subGfx    = bgGetGfxPtr(bg3Sub);
 
-	printf("dsi-camera " VER_NUMBER "\n");
+	uiHeader("DSI CAMERA");
+	uiStatus("BOOTING...");
 
 	bool fatInited = fatInitDefault();
 	if(fatInited) {
@@ -823,10 +950,10 @@ int main(int argc, char **argv) {
 			closedir(tdir);
 		}
 	} else {
-		printf("FAT init failed, photos cannot\nbe saved.\n");
+		uiStatus("NO SD CARD");
 	}
 
-	printf("Initializing...\n");
+	uiStatus("INITIALIZING...");
 	pxiWaitRemote(PXI_CAMERA); // Wait for ARM7 to initialize PXI
 	cameraInit();
 
@@ -846,10 +973,7 @@ int main(int argc, char **argv) {
 	Camera camera = CAM_OUTER;
 	cameraActivate(camera);
 
-	if(fatInited)
-		printf("\nA: swap camera\nHold L/R: take photos\nSELECT: album\nSTART or POWER: exit\n");
-	else
-		printf("\nA: swap camera\nSTART or POWER: exit\n");
+	uiCameraScreen(camera, fatInited);
 
 	while(1) {
 		u16 pressed = 0;
@@ -889,7 +1013,7 @@ int main(int argc, char **argv) {
 			camera = camera == CAM_INNER ? CAM_OUTER : CAM_INNER;
 			cameraActivate(camera);
 
-			printf("Swapped to %s camera\n", camera == CAM_INNER ? "inner" : "outer");
+			uiCameraScreen(camera, fatInited);
 		} else if(fatInited && pressed & (KEY_L | KEY_R)) {
 			// Hold L/R to keep taking photos continuously.
 			do {
@@ -903,7 +1027,7 @@ int main(int argc, char **argv) {
 				swiWaitForVBlank();
 			cameraTransferStop();
 			drainJobs(); // so the newest shots are in the list
-			viewer(gfx);
+			viewer(gfx, camera);
 		} else if(pressed & KEY_START) {
 			// Disable camera so the light turns off
 			cameraDeactivate(camera);
