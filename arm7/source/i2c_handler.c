@@ -25,46 +25,75 @@ static void micexStart(void) {
 	REG_MICEX_CNT = MICEX_CNT_NO_R | MICEX_CNT_RATE_DIV(1) | MICEX_CNT_ENABLE; // div1 = 16364Hz
 }
 
+#define MIC_NDMA_CFG                                                                               \
+	(NDMA_DST_MODE(NdmaMode_Increment) | NDMA_SRC_MODE(NdmaMode_Fixed) | NDMA_BLK_WORDS(8) |       \
+	 NDMA_TIMING(NdmaTiming_MicData) | NDMA_TX_MODE(NdmaTxMode_Timing) | NDMA_IRQ_ENABLE |         \
+	 NDMA_START)
+
+// Fully (re)initializes NDMA channel ch to capture one mic buffer into `slot`.
+// A wedged channel can't be revived with just |= NDMA_START, so always rebuild
+// it from scratch.
+static void micArmChannel(int ch, int slot) {
+	REG_NDMAxCNT(ch)  = 0;
+	REG_NDMAxSAD(ch)  = (u32)&REG_MICEX_DATA;
+	REG_NDMAxDAD(ch)  = (u32)(s_micAddr + 32 + slot * MIC_BUF_BYTES);
+	REG_NDMAxBCNT(ch) = 0;
+	REG_NDMAxTCNT(ch) = MIC_BUF_BYTES / 4;
+	REG_NDMAxWCNT(ch) = 8;
+	REG_NDMAxCNT(ch)  = MIC_NDMA_CFG;
+}
+
+// Channels 0 and 1 ping-pong: while one drains the FIFO the other is already
+// armed behind it, so a completion hands over in hardware with no IRQ-latency
+// window (the old single-channel design overran the FIFO permanently whenever
+// SD writes delayed the re-arm ISR by more than ~1ms).
+static void micProcessCompletions(void) {
+	for(int ch = 0; ch < 2; ch++) {
+		if(REG_NDMAxCNT(ch) & NDMA_START)
+			continue; // still armed/busy
+		(*s_micDone)++;
+		micArmChannel(ch, s_micSlot);
+		s_micSlot = (s_micSlot + 1) % MIC_RING_BUFS;
+	}
+}
+
 static void micNdmaIsr(void) {
 	if(!s_micActive)
 		return;
-	(*s_micDone)++;
-	s_micSlot       = (s_micSlot + 1) % MIC_RING_BUFS;
-	REG_NDMAxDAD(0) = (u32)(s_micAddr + 32 + s_micSlot * MIC_BUF_BYTES);
-	REG_NDMAxCNT(0) |= NDMA_START;
+	micProcessCompletions();
 	if(REG_MICEX_CNT & MICEX_CNT_FIFO_BORKED)
 		micexStart(); // recover from overrun
 }
 
-// A borked FIFO stalls the NDMA transfer, so the completion ISR above never
-// runs and can't do its recovery — the whole pipeline wedges after one buffer.
-// This watchdog runs off the system tick (independent of NDMA) and restarts
-// the FIFO whenever it's found dead.
+// Belt and braces: tick-driven watchdog recovers even if both channels wedge.
 static TickTask s_micWatchdog;
 
 static void micWatchdogTick(TickTask *t) {
 	if(!s_micActive)
 		return;
-	if(REG_MICEX_CNT & MICEX_CNT_FIFO_BORKED)
+	// Debug telemetry for the ARM9: heartbeat + raw MICEX/NDMA state in the
+	// unused part of the ring header.
+	vu32 *hdr = (vu32 *)s_micAddr;
+	hdr[1]++;
+	hdr[2] = REG_MICEX_CNT;
+	hdr[3] = REG_NDMAxCNT(0);
+	if(REG_MICEX_CNT & MICEX_CNT_FIFO_BORKED) {
+		micProcessCompletions();
 		micexStart();
+	}
 }
 
 static void micStart(void) {
 	s_micDone   = (vu32 *)s_micAddr;
 	*s_micDone  = 0;
-	s_micSlot   = 0;
 	s_micActive = true;
 
-	REG_MICEX_CNT    = 0;
-	REG_NDMAxSAD(0)  = (u32)&REG_MICEX_DATA;
-	REG_NDMAxDAD(0)  = (u32)(s_micAddr + 32);
-	REG_NDMAxBCNT(0) = 0;
-	REG_NDMAxTCNT(0) = MIC_BUF_BYTES / 4;
-	REG_NDMAxWCNT(0) = 8;
-	irqSet(IRQ_NDMA0, micNdmaIsr);
-	irqEnable(IRQ_NDMA0);
-	REG_NDMAxCNT(0) = NDMA_DST_MODE(NdmaMode_Increment) | NDMA_SRC_MODE(NdmaMode_Fixed) | NDMA_BLK_WORDS(8) |
-		NDMA_TIMING(NdmaTiming_MicData) | NDMA_TX_MODE(NdmaTxMode_Timing) | NDMA_IRQ_ENABLE | NDMA_START;
+	REG_MICEX_CNT = 0;
+	micArmChannel(0, 0);
+	micArmChannel(1, 1);
+	s_micSlot = 2; // next slot to arm on completion
+	irqSet(IRQ_NDMA0 | IRQ_NDMA1, micNdmaIsr);
+	irqEnable(IRQ_NDMA0 | IRQ_NDMA1);
 	micexStart();
 	tickTaskStart(&s_micWatchdog, micWatchdogTick, ticksFromHz(20), ticksFromHz(20));
 }
@@ -72,9 +101,10 @@ static void micStart(void) {
 static void micStop(void) {
 	s_micActive = false;
 	tickTaskStop(&s_micWatchdog);
-	REG_IE &= ~IRQ_NDMA0;
+	REG_IE &= ~(IRQ_NDMA0 | IRQ_NDMA1);
 	REG_MICEX_CNT   = 0;
 	REG_NDMAxCNT(0) = 0;
+	REG_NDMAxCNT(1) = 0;
 }
 
 //---------------------------------------------------------------------------------

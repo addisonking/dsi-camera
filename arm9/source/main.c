@@ -639,17 +639,19 @@ static void recordVideo(u16 *gfx, int num) {
 		if(sec != lastSec) {
 			lastSec = sec;
 		}
-		// Live telemetry every ~quarter second while debugging the mic path.
+		// Live telemetry every ~quarter second while debugging the mic path:
+		// A = drained buffers, W = ARM7 watchdog heartbeat, M/N = raw
+		// MICEX_CNT / NDMA0CNT as seen by the ARM7.
 		if((vbl & 15) == 0) {
-			char msg[40];
+			armDCacheInvalidate(s_micRing, 32);
+			vu32 *rh = (vu32 *)s_micRing;
+			char msg[48];
 			sprintf(msg,
-					"REC %d:%02d A%lu V%lu Q%lu D%lu",
-					sec / 60,
-					sec % 60,
+					"A%lu W%lu M%04lX N%08lX",
 					(unsigned long)s_micLastDone,
-					(unsigned long)framesKept,
-					(unsigned long)JOBS_PENDING,
-					(unsigned long)s_audDropped);
+					(unsigned long)rh[1],
+					(unsigned long)rh[2],
+					(unsigned long)rh[3]);
 			uiStatus(msg);
 		}
 	}
