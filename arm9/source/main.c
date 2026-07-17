@@ -432,10 +432,6 @@ static void playVideo(u16 *gfx, int num) {
 		if(audioMore)
 			fedChunks++;
 	}
-	// Debug: hold Y while starting playback to loop the prebuffered first
-	// second of file audio without ever feeding more (isolates the feed loop).
-	if(keysHeld() & KEY_Y)
-		audioMore = false;
 	armDCacheFlush(s_playRing, sizeof(s_playRing));
 
 	// Show the first frame immediately; stage the next one.
@@ -465,7 +461,7 @@ static void playVideo(u16 *gfx, int num) {
 	soundSetMixerVolume(127);
 	s_playTicks = 0;
 	soundPreparePcm(4 | SOUND_START,
-					1024,
+					2047,
 					64,
 					soundTimerFromHz(rate),
 					SoundMode_Repeat,
@@ -563,7 +559,6 @@ static void recordVideo(u16 *gfx, int num) {
 	hdr[7] = 1; // s16le mono
 	fwrite(hdr, sizeof(hdr), 1, f);
 	s_vidFile = f;
-	uiStatus("R1: FILE OPEN");
 
 	for(int i = 0; i < VID_SLOTS; i++)
 		s_vidFree[i] = (u8)i;
@@ -575,19 +570,15 @@ static void recordVideo(u16 *gfx, int num) {
 	u32 framesKept = 0, framesDropped = 0, frameIdx = 0;
 
 	// Start the ARM7 mic recorder (it NDMA-drains MICEX into the shared ring).
-	uiStatus("R2: AMP ON");
 	pmMicSetAmp(true, PmMicGain_80);
-	uiStatus("R3: FLUSH");
 	armDCacheFlush(s_micRing, sizeof(s_micRing));
 	s_micLastDone = 0;
-	uiStatus("R4: MIC START PXI");
 	u32 micAddr = (u32)s_micRing;
 	pxiSendAndReceive(PXI_CAMERA, CAM_MIC_ADDR_LO);
 	pxiSendAndReceive(PXI_CAMERA, micAddr & 0xFFFF);
 	pxiSendAndReceive(PXI_CAMERA, CAM_MIC_ADDR_HI);
 	pxiSendAndReceive(PXI_CAMERA, micAddr >> 16);
 	pxiSendAndReceive(PXI_CAMERA, CAM_MIC_START);
-	uiStatus("R5: MIC RUNNING");
 
 	// Paced by vblank count (~59.8Hz): keep a frame every keepEvery vblanks.
 	u32 vbl       = 0;
@@ -638,22 +629,8 @@ static void recordVideo(u16 *gfx, int num) {
 		int sec = (int)(vbl / 60);
 		if(sec != lastSec) {
 			lastSec = sec;
-		}
-		// Live telemetry every ~quarter second while debugging the mic path:
-		// A = drained buffers, W = watchdog heartbeat, I = ARM7 ISR count,
-		// R = watchdog recoveries, M = raw MICEX_CNT, N = armed-channel bits.
-		if((vbl & 15) == 0) {
-			armDCacheInvalidate(s_micRing, 32);
-			vu32 *rh = (vu32 *)s_micRing;
-			char msg[48];
-			sprintf(msg,
-					"A%lu W%lu I%lu R%lu M%04lX N%lu",
-					(unsigned long)s_micLastDone,
-					(unsigned long)rh[1],
-					(unsigned long)rh[4],
-					(unsigned long)rh[5],
-					(unsigned long)rh[2],
-					(unsigned long)rh[3]);
+			char msg[24];
+			sprintf(msg, "%s REC %d:%02d", (sec & 1) ? "*" : " ", sec / 60, sec % 60);
 			uiStatus(msg);
 		}
 	}
