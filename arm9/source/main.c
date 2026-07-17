@@ -116,6 +116,8 @@ static void yuvToRgb(const u16 *yuv, u8 *rgb) {
 
 static void rawPath(char *out, int num) { sprintf(out, RAW_DIR "/IMG_%04d.YUV", num); }
 static void thumbPath(char *out, int num) { sprintf(out, RAW_DIR "/IMG_%04d.THM", num); }
+static void vidPath(char *out, int num) { sprintf(out, RAW_DIR "/VID_%04d.VID", num); }
+static void vidThumbPath(char *out, int num) { sprintf(out, RAW_DIR "/VID_%04d.THM", num); }
 
 // Album grid layout: 4x3 cells of 64x48 thumbnails (raw RGB555, cached as
 // .THM files beside the raws so the grid doesn't have to read 600KB per cell).
@@ -226,9 +228,6 @@ static vu32 s_audFreeTail = 0;
 static FILE *s_vidFile    = NULL;
 static vu32 s_audBlockIdx = 0;
 static vu32 s_audDropped  = 0;
-
-static void vidPath(char *out, int num) { sprintf(out, RAW_DIR "/VID_%04d.VID", num); }
-static void vidThumbPath(char *out, int num) { sprintf(out, RAW_DIR "/VID_%04d.THM", num); }
 
 // Copies every mic buffer the ARM7 has completed into pooled audio chunks and
 // queues them for the worker. Called from the record loop; never blocks.
