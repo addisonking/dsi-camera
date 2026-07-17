@@ -10,21 +10,21 @@ Thread s_i2cPxiThread;
 alignas(8) u8 s_i2cPxiThreadStack[1024];
 
 //---------------------------------------------------------------------------------
-int i2cPxiThreadMain(void* arg) {
-//---------------------------------------------------------------------------------
+int i2cPxiThreadMain(void *arg) {
+	//---------------------------------------------------------------------------------
 	// Set up PXI mailbox, used to receive PXI command words
 	Mailbox mb;
 	u32 mb_slots[4];
-	mailboxPrepare(&mb, mb_slots, sizeof(mb_slots)/4);
+	mailboxPrepare(&mb, mb_slots, sizeof(mb_slots) / 4);
 	pxiSetMailbox(PxiChannel_User0, &mb);
 
 	// Main PXI message loop
-	for (;;) {
+	for(;;) {
 		// Receive a message
-		u32 msg = mailboxRecv(&mb);
+		u32 msg    = mailboxRecv(&mb);
 		u32 retval = 0;
 
-		switch (msg) {
+		switch(msg) {
 			case CAM_INIT:
 				init(I2C_CAM0);
 				init(I2C_CAM1);

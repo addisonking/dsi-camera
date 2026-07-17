@@ -3,7 +3,11 @@
 
 #include <nds.h>
 
-typedef struct { u8 *data; int len; int cap; } MemBuf;
+typedef struct {
+	u8 *data;
+	int len;
+	int cap;
+} MemBuf;
 
 // stbi_write_func-compatible callback that appends into a MemBuf.
 void memBufWrite(void *context, void *data, int size);

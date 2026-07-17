@@ -1,6 +1,7 @@
 #include "dsi_sign.h"
-#include "dsi_template.h"
+
 #include "dsi.h"
+#include "dsi_template.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -14,13 +15,13 @@ static void weirdFunc(u8 block[16]) {
 	u32 b[4];
 	memcpy(b, block, 16);
 	u32 tmp = b[3];
-	u64 lo = (u64)b[0] | ((u64)b[1] << 32);
+	u64 lo  = (u64)b[0] | ((u64)b[1] << 32);
 	u64 mid = (u64)b[1] | ((u64)b[2] << 32);
-	u64 hi = (u64)b[2] | ((u64)b[3] << 32);
-	b[3] = (u32)(hi >> 31);
-	b[2] = (u32)(mid >> 31);
-	b[1] = (u32)(lo >> 31);
-	b[0] = b[0] << 1;
+	u64 hi  = (u64)b[2] | ((u64)b[3] << 32);
+	b[3]    = (u32)(hi >> 31);
+	b[2]    = (u32)(mid >> 31);
+	b[1]    = (u32)(lo >> 31);
+	b[0]    = b[0] << 1;
 	if(tmp >> 31)
 		b[0] ^= 0x87;
 	memcpy(block, b, 16);
@@ -37,7 +38,7 @@ void dsiSignPhoto(u8 *file, u32 size, const u8 key[16], const u8 nonce[12]) {
 
 	// Work on a zero-padded copy; the padding is signed but never written out.
 	u32 total = (size + 0xF) & ~0xFu;
-	u8 *buf = (u8 *)malloc(total);
+	u8 *buf   = (u8 *)malloc(total);
 	memcpy(buf, file, size);
 	memset(buf + size, 0, total - size);
 	memset(&buf[DSI_OFF_SIG], 0, 0x1C);

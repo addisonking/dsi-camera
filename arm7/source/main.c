@@ -48,7 +48,7 @@ u32 g_cameraKey[4];
 
 //---------------------------------------------------------------------------------
 int main() {
-//---------------------------------------------------------------------------------
+	//---------------------------------------------------------------------------------
 
 	// Capture the camera signing key from WRAM before touching anything else.
 	memcpy(g_cameraKey, (const void *)CAMERA_KEY_ADDR, 16);
@@ -88,11 +88,12 @@ int main() {
 	// mmInstall(MAIN_THREAD_PRIO+1);
 
 	// Set up server thread
-	threadPrepare(&s_i2cPxiThread, i2cPxiThreadMain, NULL, &s_i2cPxiThreadStack[sizeof(s_i2cPxiThreadStack)], MAIN_THREAD_PRIO);
+	threadPrepare(
+		&s_i2cPxiThread, i2cPxiThreadMain, NULL, &s_i2cPxiThreadStack[sizeof(s_i2cPxiThreadStack)], MAIN_THREAD_PRIO);
 	threadStart(&s_i2cPxiThread);
 
 	// Keep the ARM7 mostly idle
-	while (pmMainLoop()) {
+	while(pmMainLoop()) {
 		threadWaitForVBlank();
 	}
 

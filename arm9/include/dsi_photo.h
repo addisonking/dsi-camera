@@ -9,8 +9,7 @@
 // string, `key` the 16-byte camera key from the ARM7 BIOS, `nonce` 12 bytes.
 // Returns a malloc'd file buffer via *outBuf and its length via *outLen; the
 // caller must free(*outBuf).
-void buildAndSignDsiPhoto(u8 *rgb640x480, const char *datetime19,
-                          const u8 key[16], const u8 nonce[12],
-                          u8 **outBuf, int *outLen);
+void buildAndSignDsiPhoto(
+	u8 *rgb640x480, const char *datetime19, const u8 key[16], const u8 nonce[12], u8 **outBuf, int *outLen);
 
 #endif // DSI_PHOTO_H

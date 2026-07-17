@@ -1,4 +1,5 @@
 #include "camera.h"
+
 #include "calico/nds/pxi.h"
 
 #include <nds.h>

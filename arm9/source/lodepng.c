@@ -40,8 +40,8 @@ Rename this file to lodepng.cpp to use it for C++, or to lodepng.c to use it for
 #endif                  /* LODEPNG_COMPILE_ALLOCATORS */
 
 #if defined(_MSC_VER) && (_MSC_VER >= 1310) /*Visual Studio: A few warning types are not desired here.*/
-	#pragma warning( \
-		disable : 4244) /*implicit conversions: not warned by gcc -Wall -Wextra and requires too much casts*/
+	#pragma warning(disable \
+					: 4244) /*implicit conversions: not warned by gcc -Wall -Wextra and requires too much casts*/
 	#pragma warning(disable : 4996) /*VS does not like fopen, but fopen_s is not standard C so unusable here*/
 #endif                              /*_MSC_VER */
 
@@ -99,14 +99,14 @@ void lodepng_free(void *ptr);
 
 /* convince the compiler to inline a function, for use when this measurably improves performance */
 /* inline is not available in C90, but use it when supported by the compiler */
-#if(defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L)) || (defined(__cplusplus) && (__cplusplus >= 199711L))
+#if (defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L)) || (defined(__cplusplus) && (__cplusplus >= 199711L))
 	#define LODEPNG_INLINE inline
 #else
 	#define LODEPNG_INLINE /* not available */
 #endif
 
 /* restrict is not available in C90, but use it when supported by the compiler */
-#if(defined(__GNUC__) && (__GNUC__ > 3 || (__GNUC__ == 3 && __GNUC_MINOR__ >= 1))) || \
+#if (defined(__GNUC__) && (__GNUC__ > 3 || (__GNUC__ == 3 && __GNUC_MINOR__ >= 1))) || \
 	(defined(_MSC_VER) && (_MSC_VER >= 1400)) || \
 	(defined(__WATCOMC__) && (__WATCOMC__ >= 1250) && !defined(__cplusplus))
 	#define LODEPNG_RESTRICT __restrict
@@ -342,7 +342,7 @@ static void lodepng_set32bitInt(unsigned char *buffer, unsigned value) {
 	buffer[0] = (unsigned char)((value >> 24) & 0xff);
 	buffer[1] = (unsigned char)((value >> 16) & 0xff);
 	buffer[2] = (unsigned char)((value >> 8) & 0xff);
-	buffer[3] = (unsigned char)((value)&0xff);
+	buffer[3] = (unsigned char)((value) & 0xff);
 }
 #endif /*defined(LODEPNG_COMPILE_PNG) || defined(LODEPNG_COMPILE_ENCODER)*/
 
@@ -5522,7 +5522,7 @@ unsigned lodepng_decode_memory(unsigned char **out,
 	lodepng_state_init(&state);
 	state.info_raw.colortype = colortype;
 	state.info_raw.bitdepth  = bitdepth;
-        #ifdef LODEPNG_COMPILE_ANCILLARY_CHUNKS
+		#ifdef LODEPNG_COMPILE_ANCILLARY_CHUNKS
 	/*disable reading things that this function doesn't output*/
 	state.decoder.read_text_chunks        = 0;
 	state.decoder.remember_unknown_chunks = 0;
@@ -5576,7 +5576,7 @@ void lodepng_decoder_settings_init(LodePNGDecoderSettings *settings) {
 	settings->remember_unknown_chunks = 0;
 	settings->max_text_size           = 16777216;
 	settings->max_icc_size            = 16777216; /* 16MB is much more than enough for any reasonable ICC profile */
-        #endif                         /*LODEPNG_COMPILE_ANCILLARY_CHUNKS*/
+		#endif                                    /*LODEPNG_COMPILE_ANCILLARY_CHUNKS*/
 	settings->ignore_crc      = 0;
 	settings->ignore_critical = 0;
 	settings->ignore_end      = 0;
@@ -6797,7 +6797,7 @@ void lodepng_encoder_settings_init(LodePNGEncoderSettings *settings) {
 	settings->auto_convert        = 1;
 	settings->force_palette       = 0;
 	settings->predefined_filters  = 0;
-        #ifdef LODEPNG_COMPILE_ANCILLARY_CHUNKS
+		#ifdef LODEPNG_COMPILE_ANCILLARY_CHUNKS
 	settings->add_id           = 0;
 	settings->text_compression = 1;
 		#endif /*LODEPNG_COMPILE_ANCILLARY_CHUNKS*/
@@ -7046,9 +7046,8 @@ const char *lodepng_error_text(unsigned code) {
 
 #ifdef LODEPNG_COMPILE_CPP
 namespace lodepng {
-
 	#ifdef LODEPNG_COMPILE_DISK
-	unsigned load_file(std::vector<unsigned char> &buffer, const std::string &filename) {
+	unsigned load_file(std::vector<unsigned char> & buffer, const std::string &filename) {
 		long size = lodepng_filesize(filename.c_str());
 		if(size < 0)
 			return 78;
@@ -7064,7 +7063,7 @@ namespace lodepng {
 
 	#ifdef LODEPNG_COMPILE_ZLIB
 		#ifdef LODEPNG_COMPILE_DECODER
-	unsigned decompress(std::vector<unsigned char> &out,
+	unsigned decompress(std::vector<unsigned char> & out,
 						const unsigned char *in,
 						size_t insize,
 						const LodePNGDecompressSettings &settings) {
@@ -7078,7 +7077,7 @@ namespace lodepng {
 		return error;
 	}
 
-	unsigned decompress(std::vector<unsigned char> &out,
+	unsigned decompress(std::vector<unsigned char> & out,
 						const std::vector<unsigned char> &in,
 						const LodePNGDecompressSettings &settings) {
 		return decompress(out, in.empty() ? 0 : &in[0], in.size(), settings);
@@ -7086,7 +7085,7 @@ namespace lodepng {
 		#endif /* LODEPNG_COMPILE_DECODER */
 
 		#ifdef LODEPNG_COMPILE_ENCODER
-	unsigned compress(std::vector<unsigned char> &out,
+	unsigned compress(std::vector<unsigned char> & out,
 					  const unsigned char *in,
 					  size_t insize,
 					  const LodePNGCompressSettings &settings) {
@@ -7100,7 +7099,7 @@ namespace lodepng {
 		return error;
 	}
 
-	unsigned compress(std::vector<unsigned char> &out,
+	unsigned compress(std::vector<unsigned char> & out,
 					  const std::vector<unsigned char> &in,
 					  const LodePNGCompressSettings &settings) {
 		return compress(out, in.empty() ? 0 : &in[0], in.size(), settings);
@@ -7119,14 +7118,14 @@ namespace lodepng {
 
 	State::~State() { lodepng_state_cleanup(this); }
 
-	State &State::operator=(const State &other) {
+	State &State::operator = (const State &other) {
 		lodepng_state_copy(this, &other);
 		return *this;
 	}
 
 		#ifdef LODEPNG_COMPILE_DECODER
 
-	unsigned decode(std::vector<unsigned char> &out,
+	unsigned decode(std::vector<unsigned char> & out,
 					unsigned &w,
 					unsigned &h,
 					const unsigned char *in,
@@ -7146,7 +7145,7 @@ namespace lodepng {
 		return error;
 	}
 
-	unsigned decode(std::vector<unsigned char> &out,
+	unsigned decode(std::vector<unsigned char> & out,
 					unsigned &w,
 					unsigned &h,
 					const std::vector<unsigned char> &in,
@@ -7155,7 +7154,7 @@ namespace lodepng {
 		return decode(out, w, h, in.empty() ? 0 : &in[0], (unsigned)in.size(), colortype, bitdepth);
 	}
 
-	unsigned decode(std::vector<unsigned char> &out,
+	unsigned decode(std::vector<unsigned char> & out,
 					unsigned &w,
 					unsigned &h,
 					State &state,
@@ -7171,13 +7170,16 @@ namespace lodepng {
 		return error;
 	}
 
-	unsigned decode(
-		std::vector<unsigned char> &out, unsigned &w, unsigned &h, State &state, const std::vector<unsigned char> &in) {
+	unsigned decode(std::vector<unsigned char> & out,
+					unsigned &w,
+					unsigned &h,
+					State &state,
+					const std::vector<unsigned char> &in) {
 		return decode(out, w, h, state, in.empty() ? 0 : &in[0], in.size());
 	}
 
 			#ifdef LODEPNG_COMPILE_DISK
-	unsigned decode(std::vector<unsigned char> &out,
+	unsigned decode(std::vector<unsigned char> & out,
 					unsigned &w,
 					unsigned &h,
 					const std::string &filename,
@@ -7195,7 +7197,7 @@ namespace lodepng {
 		#endif     /* LODEPNG_COMPILE_DISK */
 
 		#ifdef LODEPNG_COMPILE_ENCODER
-	unsigned encode(std::vector<unsigned char> &out,
+	unsigned encode(std::vector<unsigned char> & out,
 					const unsigned char *in,
 					unsigned w,
 					unsigned h,
@@ -7211,7 +7213,7 @@ namespace lodepng {
 		return error;
 	}
 
-	unsigned encode(std::vector<unsigned char> &out,
+	unsigned encode(std::vector<unsigned char> & out,
 					const std::vector<unsigned char> &in,
 					unsigned w,
 					unsigned h,
@@ -7222,7 +7224,7 @@ namespace lodepng {
 		return encode(out, in.empty() ? 0 : &in[0], w, h, colortype, bitdepth);
 	}
 
-	unsigned encode(std::vector<unsigned char> &out, const unsigned char *in, unsigned w, unsigned h, State &state) {
+	unsigned encode(std::vector<unsigned char> & out, const unsigned char *in, unsigned w, unsigned h, State &state) {
 		unsigned char *buffer;
 		size_t buffersize;
 		unsigned error = lodepng_encode(&buffer, &buffersize, in, w, h, &state);
@@ -7234,7 +7236,7 @@ namespace lodepng {
 	}
 
 	unsigned encode(
-		std::vector<unsigned char> &out, const std::vector<unsigned char> &in, unsigned w, unsigned h, State &state) {
+		std::vector<unsigned char> & out, const std::vector<unsigned char> &in, unsigned w, unsigned h, State &state) {
 		if(lodepng_get_raw_size(w, h, &state.info_raw) > in.size())
 			return 84;
 		return encode(out, in.empty() ? 0 : &in[0], w, h, state);
