@@ -131,6 +131,7 @@ typedef struct Photo {
 	int num;
 	time_t ts;    // capture time = the raw file's FAT mtime
 	bool isVideo; // VID_%04d.VID instead of IMG_%04d.YUV
+	u16 durSec;   // video duration in seconds (0 for photos)
 } Photo;
 
 static int cmpPhoto(const void *a, const void *b) {
@@ -156,6 +157,7 @@ static int scanRaw(Photo **outPhotos) {
 				ph = (Photo *)realloc(ph, (cap *= 2) * sizeof(Photo));
 			ph[count].num     = atoi(pent->d_name + 4);
 			ph[count].isVideo = isVideo;
+			ph[count].durSec  = 0;
 			char path[40];
 			if(isVideo)
 				vidPath(path, ph[count].num);
@@ -163,6 +165,19 @@ static int scanRaw(Photo **outPhotos) {
 				rawPath(path, ph[count].num);
 			struct stat st;
 			ph[count].ts = stat(path, &st) == 0 ? st.st_mtime : 0;
+			if(isVideo) {
+				// Duration from the container header, for the album grid.
+				FILE *vf = fopen(path, "rb");
+				if(vf) {
+					u32 vh[10];
+					if(fread(vh, sizeof(vh), 1, vf) == 1 && memcmp(vh, VID_MAGIC, 8) == 0) {
+						u32 vsec = vh[4] ? vh[8] / vh[4] : 0;
+						u32 asec = vh[6] ? vh[9] / vh[6] : 0;
+						ph[count].durSec = (u16)(vsec > asec ? vsec : asec);
+					}
+					fclose(vf);
+				}
+			}
 			count++;
 		}
 		closedir(pdir);
@@ -1076,10 +1091,18 @@ static void composeAlbum(u16 *gfx,
 			if(yy >= 0 && yy < SCREEN_H)
 				memcpy(gfx + yy * 256 + px[i], thumbs + i * THUMB_W * THUMB_H + y * THUMB_W, THUMB_W * 2);
 		}
-		// Play marker on videos: ">" bottom-right of the cell.
+		// Videos get their duration bottom-right of the cell.
 		if(ph[i].isVideo) {
-			char m[2] = ">";
-			drawText(gfx, px[i] + THUMB_W - 8, dy + THUMB_H - 9, m, BIT(15) | RGB15(31, 31, 31));
+			char m[8];
+			sprintf(m, "%d:%02d", ph[i].durSec / 60, ph[i].durSec % 60);
+			int tw = (int)strlen(m) * 6;
+			int tx = px[i] + THUMB_W - tw - 2;
+			for(int y = 0; y < 9; y++) {
+				int yy = dy + THUMB_H - 10 + y;
+				if(yy >= 0 && yy < SCREEN_H)
+					hline(gfx, tx - 2, yy, tw + 3, BIT(15) | RGB15(2, 2, 3));
+			}
+			drawText(gfx, tx, dy + THUMB_H - 9, m, BIT(15) | RGB15(28, 28, 30));
 		}
 	}
 
