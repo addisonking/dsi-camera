@@ -34,8 +34,17 @@
 
 int clamp(int val, int min, int max) { return val < min ? min : (val > max ? max : val); }
 
-static u16 *s_subGfx; // bottom-screen bitmap, drawn by the ui* helpers
+static u16 *s_subGfx;   // bottom-screen bitmap, drawn by the ui* helpers
+static Camera s_camera; // currently active camera
 static void uiStatus(const char *s);
+
+// Lid closed: shut the camera off and sleep until it reopens. Usable from any
+// screen; VRAM survives sleep so nothing needs redrawing after.
+static void lidSleep(void) {
+	cameraDeactivate(s_camera);
+	pmEnterSleep();
+	cameraActivate(s_camera);
+}
 
 // Draws a raw 640x480 YUV422 frame downscaled (nearest-neighbour) to a
 // dw x dh RGB555 image in `dst` with row stride `stride`.
@@ -718,6 +727,10 @@ static bool fullView(u16 *gfx, const Photo *ph, int count, int *idx) {
 
 		swiWaitForVBlank();
 		scanKeys();
+		if(keysHeld() & KEY_LID) {
+			lidSleep();
+			continue;
+		}
 		u16 pressed = keysDown();
 
 		if(pressed & KEY_LEFT) {
@@ -789,6 +802,10 @@ static void viewer(u16 *gfx, int cam) {
 		while(!reload && !pmShouldReset()) {
 			swiWaitForVBlank();
 			scanKeys();
+			if(keysHeld() & KEY_LID) {
+				lidSleep();
+				continue;
+			}
 			u16 pressed = keysDownRepeat();
 
 			int prevSel = sel;
@@ -971,6 +988,7 @@ int main(int argc, char **argv) {
 	threadStart(&s_workerThread);
 
 	Camera camera = CAM_OUTER;
+	s_camera      = camera;
 	cameraActivate(camera);
 
 	uiCameraScreen(camera, fatInited);
@@ -1010,7 +1028,8 @@ int main(int argc, char **argv) {
 			cameraTransferStop();
 
 			// Switch camera
-			camera = camera == CAM_INNER ? CAM_OUTER : CAM_INNER;
+			camera   = camera == CAM_INNER ? CAM_OUTER : CAM_INNER;
+			s_camera = camera;
 			cameraActivate(camera);
 
 			uiCameraScreen(camera, fatInited);
