@@ -460,7 +460,7 @@ static void playVideo(u16 *gfx, int num) {
 	// Start the audio clock and the looping channel together.
 	soundSetMixerVolume(127);
 	s_playTicks = 0;
-	soundPreparePcm(1 | SOUND_START,
+	soundPreparePcm(4 | SOUND_START,
 					1024,
 					64,
 					soundTimerFromHz(rate),
@@ -529,7 +529,7 @@ static void playVideo(u16 *gfx, int num) {
 	}
 
 	timerStop(0);
-	soundStop(BIT(1));
+	soundStop(BIT(4));
 	fclose(fa);
 	fclose(fv);
 	free(stage);
@@ -1491,6 +1491,9 @@ int main(int argc, char **argv) {
 	pxiWaitRemote(PXI_CAMERA); // Wait for ARM7 to initialize PXI
 	cameraInit();
 	soundInit(); // ARM9 interface to the ARM7 sound driver (video playback)
+	soundPowerOn();
+	soundSetMixerConfig(SoundOutSrc_Mixer, SoundOutSrc_Mixer, false, false);
+	soundSetMixerVolume(127);
 
 	// Fetch the 16-byte camera signing key from the ARM7 (it read it from the
 	// BIOS-populated WRAM at boot), as 8 halfwords because PXI immediates are
