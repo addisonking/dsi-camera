@@ -34,7 +34,7 @@ typedef enum {
 	CAM_MIC_ADDR_HI,
 	CAM_MIC_START,
 	CAM_MIC_STOP,
-	// Camera LED (BPTWL reg 0x31) as shutter feedback.
+	// Power LED (BPTWL reg 0x63): OFF = steady blue, ON/BLINK = blinking.
 	CAM_LED_OFF,
 	CAM_LED_ON,
 	CAM_LED_BLINK
