@@ -77,9 +77,9 @@ int main() {
 	touchInit();
 	touchStartServer(80, MAIN_THREAD_PRIO);
 
-	// // Set up sound and mic driver
-	// soundStartServer(MAIN_THREAD_PRIO-0x10);
-	// micStartServer(MAIN_THREAD_PRIO-0x18);
+	// Sound driver (playback). Mic is handled by our own recorder in
+	// i2c_handler.c, not calico's mic server.
+	soundStartServer(MAIN_THREAD_PRIO - 0x10);
 
 	// // Set up wireless manager
 	// wlmgrStartServer(MAIN_THREAD_PRIO-8);

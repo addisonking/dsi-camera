@@ -1,6 +1,7 @@
 #include "camera.h"
 #include "version.h"
 
+#include <calico/arm/cache.h>
 #include <calico/nds/pm.h>
 #include <calico/nds/pxi.h>
 #include <calico/system/mailbox.h>
@@ -13,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <time.h>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -34,9 +36,11 @@
 
 int clamp(int val, int min, int max) { return val < min ? min : (val > max ? max : val); }
 
-static u16 *s_subGfx;   // bottom-screen bitmap, drawn by the ui* helpers
-static Camera s_camera; // currently active camera
+static u16 *s_subGfx;    // bottom-screen bitmap, drawn by the ui* helpers
+static Camera s_camera;  // currently active camera
+static bool s_videoMode; // camera screen: photo vs video mode
 static void uiStatus(const char *s);
+void uiSpace(void);
 
 // Lid closed: shut the camera off and sleep until it reopens. Usable from any
 // screen; VRAM survives sleep so nothing needs redrawing after.
@@ -45,6 +49,28 @@ static void lidSleep(void) {
 	pmEnterSleep();
 	cameraActivate(s_camera);
 }
+
+// --- Video recording: 256x192 RGB555 frames from preview mode + mic audio,
+// --- written as a custom .VID container by the worker thread.
+
+#define VID_FPS 10 // what a DSi SD card can actually sustain (~1MB/s)
+#define VID_W 256
+#define VID_H 192
+#define VID_FRAME_SIZE (VID_W * VID_H * 2)
+#define VID_SLOTS 24 // ~2.4MB ring; a frame is dropped if it fills
+#define AUD_CHUNKS 16
+
+#define VID_MAGIC "DSIVID01"
+#define CHUNK_VIDEO 1
+#define CHUNK_AUDIO 2
+#define MIC_RATE_HZ 16364 // MICEX rate div1
+
+// Mic ring shared with the ARM7 (see pxi_vars.h); ARM9 polls the completion
+// counter and copies finished buffers out. Lives in this binary; the address
+// is sent to the ARM7 before each CAM_MIC_START.
+alignas(32) static u8 s_micRing[32 + MIC_RING_BUFS * MIC_BUF_BYTES];
+static vu32 *s_micDone = (vu32 *)s_micRing;
+static u32 s_micLastDone;
 
 // Draws a raw 640x480 YUV422 frame downscaled (nearest-neighbour) to a
 // dw x dh RGB555 image in `dst` with row stride `stride`.
@@ -101,7 +127,8 @@ static void thumbPath(char *out, int num) { sprintf(out, RAW_DIR "/IMG_%04d.THM"
 
 typedef struct Photo {
 	int num;
-	time_t ts; // capture time = the raw file's FAT mtime
+	time_t ts;    // capture time = the raw file's FAT mtime
+	bool isVideo; // VID_%04d.VID instead of IMG_%04d.YUV
 } Photo;
 
 static int cmpPhoto(const void *a, const void *b) {
@@ -120,13 +147,18 @@ static int scanRaw(Photo **outPhotos) {
 	if(pdir) {
 		struct dirent *pent;
 		while((pent = readdir(pdir))) {
-			if(strncmp(pent->d_name, "IMG_", 4) != 0 || !strstr(pent->d_name, ".YUV"))
+			bool isVideo = strncmp(pent->d_name, "VID_", 4) == 0 && strstr(pent->d_name, ".VID");
+			if(!isVideo && (strncmp(pent->d_name, "IMG_", 4) != 0 || !strstr(pent->d_name, ".YUV")))
 				continue;
 			if(count == cap)
 				ph = (Photo *)realloc(ph, (cap *= 2) * sizeof(Photo));
-			ph[count].num = atoi(pent->d_name + 4);
+			ph[count].num     = atoi(pent->d_name + 4);
+			ph[count].isVideo = isVideo;
 			char path[40];
-			rawPath(path, ph[count].num);
+			if(isVideo)
+				vidPath(path, ph[count].num);
+			else
+				rawPath(path, ph[count].num);
 			struct stat st;
 			ph[count].ts = stat(path, &st) == 0 ? st.st_mtime : 0;
 			count++;
@@ -146,13 +178,20 @@ static int dayKey(time_t t) {
 
 // Async save pipeline: the main thread captures raw YUV frames and queues
 // them here; a lower-priority worker thread writes them to SD in the
-// background so burst shots are only limited by capture time.
-typedef struct FrameJob {
-	u16 *yuv;
-	int num;
-} FrameJob;
+// background so burst shots are only limited by capture time. The same queue
+// carries video-frame and audio chunks while recording.
+#define JOB_PHOTO 0
+// (JOB_ values 1 and 2 are CHUNK_VIDEO / CHUNK_AUDIO)
 
-#define JOB_QUEUE_LEN 8 // ~600KB per raw frame, so ~4.8MB queued at most
+typedef struct Job {
+	u32 type; // JOB_PHOTO / CHUNK_VIDEO / CHUNK_AUDIO
+	u32 aux;  // photo num / chunk index (frame or audio block number)
+	u32 slot; // ring/pool slot to return after writing (video/audio)
+	u32 size; // payload bytes (video/audio)
+	u16 *buf;
+} Job;
+
+#define JOB_QUEUE_LEN 32
 
 static Thread s_workerThread;
 alignas(8) static u8 s_workerStack[32 * 1024];
@@ -164,37 +203,106 @@ static vu32 s_jobsDone   = 0;
 #define JOBS_PENDING (s_jobsQueued - s_jobsDone)
 
 static int s_nextRawNum = 1;
+static int s_nextVidNum = 1;
 static u8 s_camKey[16];
+
+// Video frame ring (producer: record loop; consumer: worker).
+static u16 s_vidRing[VID_SLOTS][VID_W * VID_H];
+static Job s_vidJobs[VID_SLOTS];
+static u8 s_vidFree[VID_SLOTS]; // SPSC ring of free slot indices
+static vu32 s_vidFreeHead = 0;  // written by worker
+static vu32 s_vidFreeTail = 0;  // written by record loop
+
+// Audio chunk pool (producer: record loop via micDrain; consumer: worker).
+typedef struct AudioChunk {
+	Job job;
+	alignas(32) u8 data[MIC_BUF_BYTES];
+} AudioChunk;
+static AudioChunk s_audPool[AUD_CHUNKS];
+static u8 s_audFree[AUD_CHUNKS];
+static vu32 s_audFreeHead = 0;
+static vu32 s_audFreeTail = 0;
+
+static FILE *s_vidFile    = NULL;
+static vu32 s_audBlockIdx = 0;
+static vu32 s_audDropped  = 0;
+
+static void vidPath(char *out, int num) { sprintf(out, RAW_DIR "/VID_%04d.VID", num); }
+static void vidThumbPath(char *out, int num) { sprintf(out, RAW_DIR "/VID_%04d.THM", num); }
+
+// Copies every mic buffer the ARM7 has completed into pooled audio chunks and
+// queues them for the worker. Called from the record loop; never blocks.
+static void micDrain(void) {
+	armDCacheInvalidate(s_micRing, 32);
+	u32 done = *s_micDone;
+	while(s_micLastDone < done) {
+		u8 *src = s_micRing + 32 + (s_micLastDone % MIC_RING_BUFS) * MIC_BUF_BYTES;
+		armDCacheInvalidate(src, MIC_BUF_BYTES);
+		if(s_audFreeTail == s_audFreeHead + AUD_CHUNKS) {
+			s_audDropped++;
+		} else {
+			int idx       = s_audFree[s_audFreeTail++ % AUD_CHUNKS];
+			AudioChunk *c = &s_audPool[idx];
+			memcpy(c->data, src, MIC_BUF_BYTES);
+			c->job.type = CHUNK_AUDIO;
+			c->job.aux  = s_audBlockIdx++;
+			c->job.slot = (u32)idx;
+			c->job.size = MIC_BUF_BYTES;
+			c->job.buf  = (u16 *)c->data;
+			if(!mailboxTrySend(&s_jobMailbox, (u32)&c->job)) {
+				s_audFreeTail--; // queue full, give the chunk back
+				s_audBlockIdx--;
+				s_audDropped++;
+			} else {
+				s_jobsQueued++;
+			}
+		}
+		s_micLastDone++;
+	}
+}
 
 static int workerMain(void *arg) {
 	for(;;) {
-		FrameJob *job = (FrameJob *)mailboxRecv(&s_jobMailbox);
+		Job *job = (Job *)mailboxRecv(&s_jobMailbox);
 
-		char path[40];
-		rawPath(path, job->num);
-		FILE *f = fopen(path, "wb");
-		char msg[32];
-		if(f) {
-			fwrite(job->yuv, 1, RAW_SIZE, f);
-			fclose(f);
-			sprintf(msg, "SAVED IMG_%04d", job->num);
+		if(job->type == JOB_PHOTO) {
+			char path[40];
+			rawPath(path, job->aux);
+			FILE *f = fopen(path, "wb");
+			char msg[32];
+			if(f) {
+				fwrite(job->buf, 1, RAW_SIZE, f);
+				fclose(f);
+				sprintf(msg, "SAVED IMG_%04d", job->aux);
+			} else {
+				sprintf(msg, "SAVE FAILED: IMG_%04d", job->aux);
+			}
+			uiStatus(msg);
+
+			// Thumbnail cache for the album grid.
+			u16 thumb[THUMB_W * THUMB_H];
+			blitYuvScaled(job->buf, thumb, THUMB_W, THUMB_W, THUMB_H);
+			thumbPath(path, job->aux);
+			f = fopen(path, "wb");
+			if(f) {
+				fwrite(thumb, 1, sizeof(thumb), f);
+				fclose(f);
+			}
+
+			free(job->buf);
+			free(job);
 		} else {
-			sprintf(msg, "SAVE FAILED: IMG_%04d", job->num);
+			// Video/audio chunk: header + payload into the open .VID file.
+			if(s_vidFile) {
+				u32 hdr[3] = {job->type, job->aux, job->size};
+				fwrite(hdr, sizeof(hdr), 1, s_vidFile);
+				fwrite(job->buf, job->size, 1, s_vidFile);
+			}
+			if(job->type == CHUNK_VIDEO)
+				s_vidFree[s_vidFreeHead++ % VID_SLOTS] = (u8)job->slot;
+			else
+				s_audFree[s_audFreeHead++ % AUD_CHUNKS] = (u8)job->slot;
 		}
-		uiStatus(msg);
-
-		// Thumbnail cache for the album grid.
-		u16 thumb[THUMB_W * THUMB_H];
-		blitYuvScaled(job->yuv, thumb, THUMB_W, THUMB_W, THUMB_H);
-		thumbPath(path, job->num);
-		f = fopen(path, "wb");
-		if(f) {
-			fwrite(thumb, 1, sizeof(thumb), f);
-			fclose(f);
-		}
-
-		free(job->yuv);
-		free(job);
 		s_jobsDone++;
 	}
 	return 0;
@@ -218,13 +326,13 @@ static void captureRaw(u16 *previewGfx) {
 	while(cameraTransferActive())
 		swiWaitForVBlank();
 
-	u16 *yuv      = NULL;
-	FrameJob *job = NULL;
+	u16 *yuv = NULL;
+	Job *job = NULL;
 	for(;;) {
 		if(!yuv)
 			yuv = (u16 *)malloc(RAW_SIZE);
 		if(!job)
-			job = (FrameJob *)malloc(sizeof(FrameJob));
+			job = (Job *)malloc(sizeof(Job));
 		if(yuv && job)
 			break;
 		// Out of RAM: let the worker finish a frame and retry.
@@ -243,11 +351,339 @@ static void captureRaw(u16 *previewGfx) {
 	if(previewGfx)
 		blitYuv(yuv, previewGfx);
 
-	job->yuv = yuv;
-	job->num = s_nextRawNum++;
+	job->type = JOB_PHOTO;
+	job->aux  = s_nextRawNum++;
+	job->buf  = yuv;
 	while(!mailboxTrySend(&s_jobMailbox, (u32)job))
 		swiWaitForVBlank(); // queue full, wait for the worker
 	s_jobsQueued++;
+}
+
+// --- Video playback: audio streams through a looping ring while frames are
+// --- blitted at their pacing-slot times. One 16kHz timer is the single A/V
+// --- clock, so sound and picture can't drift apart.
+
+#define PLAY_RING_HALF 8192 // samples per ring half (16KB)
+alignas(32) static s16 s_playRing[2 * PLAY_RING_HALF];
+static vu32 s_playTicks;
+
+static void playTickIsr(void) { s_playTicks++; }
+
+// Reads the next chunk of `wantType` from f, skipping over chunks of the other
+// type. Returns false at EOF/corruption.
+static bool vidReadChunk(FILE *f, u32 wantType, u32 *outIdx, void *buf, u32 bufSz) {
+	for(;;) {
+		u32 hdr[3];
+		if(fread(hdr, sizeof(hdr), 1, f) != 1)
+			return false;
+		if(hdr[2] > bufSz)
+			return false;
+		if(hdr[0] == wantType) {
+			*outIdx = hdr[1];
+			return fread(buf, hdr[2], 1, f) == 1;
+		}
+		fseek(f, hdr[2], SEEK_CUR);
+	}
+}
+
+// Reads a video's first frame into gfx (which is also its display bitmap).
+static bool vidReadFirstFrame(FILE *f, u16 *gfx) {
+	u32 hdr[10];
+	if(fread(hdr, sizeof(hdr), 1, f) != 1 || memcmp(hdr, VID_MAGIC, 8) != 0)
+		return false;
+	u32 idx;
+	return vidReadChunk(f, CHUNK_VIDEO, &idx, gfx, VID_FRAME_SIZE);
+}
+
+static void playVideo(u16 *gfx, int num) {
+	char path[40];
+	vidPath(path, num);
+	FILE *fv = fopen(path, "rb");
+	if(!fv) {
+		uiStatus("CANT OPEN FILE");
+		return;
+	}
+	u32 hdr[10];
+	if(fread(hdr, sizeof(hdr), 1, fv) != 1 || memcmp(hdr, VID_MAGIC, 8) != 0) {
+		fclose(fv);
+		uiStatus("BAD VIDEO FILE");
+		return;
+	}
+	u32 fps          = hdr[4] ? hdr[4] : VID_FPS;
+	u32 rate         = hdr[6] ? hdr[6] : MIC_RATE_HZ;
+	u32 totalFrames  = hdr[8];
+	u32 totalSamples = hdr[9];
+	FILE *fa         = fopen(path, "rb");
+	if(!fa) {
+		fclose(fv);
+		uiStatus("CANT OPEN FILE");
+		return;
+	}
+	fseek(fa, sizeof(hdr), SEEK_SET);
+
+	uiStatus("LOADING...");
+
+	// Prebuffer two ring halves of audio (zero-padded = silence).
+	memset(s_playRing, 0, sizeof(s_playRing));
+	u32 fedChunks  = 0, aIdx;
+	bool audioMore = true;
+	while(fedChunks < 2 && audioMore) {
+		audioMore = vidReadChunk(fa, CHUNK_AUDIO, &aIdx, s_playRing + fedChunks * PLAY_RING_HALF, PLAY_RING_HALF * 2);
+		if(audioMore)
+			fedChunks++;
+	}
+	armDCacheFlush(s_playRing, sizeof(s_playRing));
+
+	// Show the first frame immediately; stage the next one.
+	u16 *stage = (u16 *)malloc(VID_FRAME_SIZE);
+	u32 vIdx = 0, stageIdx = 0;
+	bool videoMore   = vidReadChunk(fv, CHUNK_VIDEO, &vIdx, gfx, VID_FRAME_SIZE);
+	bool stageFilled = false;
+	if(videoMore) {
+		u32 next;
+		if(vidReadChunk(fv, CHUNK_VIDEO, &next, stage, VID_FRAME_SIZE)) {
+			stageIdx    = next;
+			stageFilled = true;
+		} else {
+			videoMore = false;
+		}
+	}
+
+	if(!videoMore && totalSamples == 0) {
+		uiStatus("EMPTY VIDEO");
+		fclose(fa);
+		fclose(fv);
+		free(stage);
+		return;
+	}
+
+	// Start the audio clock and the looping channel together.
+	soundSetMixerVolume(127);
+	s_playTicks = 0;
+	soundPreparePcm(1 | SOUND_START,
+					1024,
+					64,
+					soundTimerFromHz(rate),
+					SoundMode_Repeat,
+					SoundFmt_Pcm16,
+					s_playRing,
+					0,
+					sizeof(s_playRing) / 4);
+	timerStart(0, ClockDivider_64, TIMER_FREQ_64(rate), playTickIsr);
+
+	u32 durSec = totalFrames / fps;
+	if(totalSamples / rate > durSec)
+		durSec = totalSamples / rate;
+	int lastSec = -1;
+
+	for(;;) {
+		swiWaitForVBlank();
+		scanKeys();
+		if(keysDown() & (KEY_B | KEY_A | KEY_START | KEY_SELECT) || (keysHeld() & KEY_LID) || pmShouldReset())
+			break;
+
+		u32 played       = s_playTicks;
+		u32 playedHalves = played / PLAY_RING_HALF;
+
+		// Keep the ring filled one half ahead of playback.
+		while(audioMore && fedChunks <= playedHalves + 1) {
+			audioMore =
+				vidReadChunk(fa, CHUNK_AUDIO, &aIdx, s_playRing + (fedChunks % 2) * PLAY_RING_HALF, PLAY_RING_HALF * 2);
+			if(audioMore) {
+				armDCacheFlush(s_playRing + (fedChunks % 2) * PLAY_RING_HALF, PLAY_RING_HALF * 2);
+				fedChunks++;
+			}
+		}
+
+		// Show the staged frame once its pacing slot is due.
+		if(stageFilled && (u64)played * fps >= (u64)stageIdx * rate) {
+			memcpy(gfx, stage, VID_FRAME_SIZE);
+			stageFilled = false;
+			u32 next;
+			if(vidReadChunk(fv, CHUNK_VIDEO, &next, stage, VID_FRAME_SIZE)) {
+				stageIdx    = next;
+				stageFilled = true;
+			} else {
+				videoMore = false;
+			}
+		}
+
+		bool audioDone = !audioMore && played >= (u64)fedChunks * PLAY_RING_HALF;
+		if(!videoMore && !stageFilled && audioDone)
+			break;
+
+		int sec = (int)(played / rate);
+		if(sec != lastSec) {
+			lastSec = sec;
+			char msg[32];
+			sprintf(msg,
+					"PLAYING %d:%02d / %lu:%02lu",
+					sec / 60,
+					sec % 60,
+					(unsigned long)(durSec / 60),
+					(unsigned long)(durSec % 60));
+			uiStatus(msg);
+		}
+	}
+
+	timerStop(0);
+	soundStop(BIT(1));
+	fclose(fa);
+	fclose(fv);
+	free(stage);
+	uiStatus("B: BACK");
+}
+
+// Records video + mic audio to a .VID container until L/R is tapped again (or
+// the lid closes / power is tapped). Frames are paced to VID_FPS on the wall
+// clock; if the SD card falls behind, video frames are dropped (never audio).
+static void recordVideo(u16 *gfx, int num) {
+	char path[40];
+	vidPath(path, num);
+	FILE *f = fopen(path, "wb");
+	if(!f) {
+		uiStatus("CANT OPEN FILE");
+		return;
+	}
+
+	// Container header; the two totals are patched in at stop.
+	u32 hdr[10] = {0};
+	memcpy(hdr, VID_MAGIC, 8);
+	hdr[2] = VID_W;
+	hdr[3] = VID_H;
+	hdr[4] = VID_FPS;
+	hdr[5] = 1;
+	hdr[6] = MIC_RATE_HZ;
+	hdr[7] = 1; // s16le mono
+	fwrite(hdr, sizeof(hdr), 1, f);
+	s_vidFile = f;
+	uiStatus("R1: FILE OPEN");
+
+	for(int i = 0; i < VID_SLOTS; i++)
+		s_vidFree[i] = (u8)i;
+	for(int i = 0; i < AUD_CHUNKS; i++)
+		s_audFree[i] = (u8)i;
+	s_vidFreeHead = s_vidFreeTail = 0;
+	s_audFreeHead = s_audFreeTail = 0;
+	s_audBlockIdx = s_audDropped = 0;
+	u32 framesKept = 0, framesDropped = 0, frameIdx = 0;
+
+	// Start the ARM7 mic recorder (it NDMA-drains MICEX into the shared ring).
+	uiStatus("R2: AMP ON");
+	pmMicSetAmp(true, PmMicGain_80);
+	uiStatus("R3: FLUSH");
+	armDCacheFlush(s_micRing, sizeof(s_micRing));
+	s_micLastDone = 0;
+	uiStatus("R4: MIC START PXI");
+	u32 micAddr = (u32)s_micRing;
+	pxiSendAndReceive(PXI_CAMERA, CAM_MIC_ADDR_LO);
+	pxiSendAndReceive(PXI_CAMERA, micAddr & 0xFFFF);
+	pxiSendAndReceive(PXI_CAMERA, CAM_MIC_ADDR_HI);
+	pxiSendAndReceive(PXI_CAMERA, micAddr >> 16);
+	pxiSendAndReceive(PXI_CAMERA, CAM_MIC_START);
+	uiStatus("R5: MIC RUNNING");
+
+	// Paced by vblank count (~59.8Hz): keep a frame every keepEvery vblanks.
+	u32 vbl       = 0;
+	u32 keepEvery = 60 / VID_FPS;
+	u32 lastKeep  = 0;
+	int lastSec   = -1;
+	bool stop     = false;
+
+	while(!stop) {
+		swiWaitForVBlank();
+		vbl++;
+		scanKeys();
+		if(keysDown() & (KEY_L | KEY_R) || (keysHeld() & KEY_LID) || pmShouldReset())
+			stop = true;
+
+		if(!cameraTransferActive()) {
+			if(vbl - lastKeep >= keepEvery) {
+				lastKeep = lastKeep ? lastKeep + keepEvery : vbl;
+				// frameIdx counts pacing slots (not kept frames), so dropped
+				// frames leave index gaps that playback/conversion can
+				// duplicate over — A/V sync survives drops.
+				if(s_vidFreeTail == s_vidFreeHead + VID_SLOTS) {
+					framesDropped++;
+					frameIdx++;
+				} else {
+					int slot = s_vidFree[s_vidFreeTail++ % VID_SLOTS];
+					memcpy(s_vidRing[slot], gfx, VID_FRAME_SIZE);
+					Job *job  = &s_vidJobs[slot];
+					job->type = CHUNK_VIDEO;
+					job->aux  = frameIdx++;
+					job->slot = (u32)slot;
+					job->size = VID_FRAME_SIZE;
+					job->buf  = s_vidRing[slot];
+					if(!mailboxTrySend(&s_jobMailbox, (u32)job)) {
+						s_vidFreeTail--; // queue full, give the slot back
+						framesDropped++;
+					} else {
+						s_jobsQueued++;
+						framesKept++;
+					}
+				}
+			}
+			cameraTransferStart(gfx, CAPTURE_MODE_PREVIEW); // re-arm viewfinder
+		}
+
+		micDrain();
+
+		int sec = (int)(vbl / 60);
+		if(sec != lastSec) {
+			lastSec = sec;
+		}
+		// Live telemetry every ~quarter second while debugging the mic path.
+		if((vbl & 15) == 0) {
+			char msg[40];
+			sprintf(msg,
+					"REC %d:%02d A%lu V%lu Q%lu D%lu",
+					sec / 60,
+					sec % 60,
+					(unsigned long)s_micLastDone,
+					(unsigned long)framesKept,
+					(unsigned long)JOBS_PENDING,
+					(unsigned long)s_audDropped);
+			uiStatus(msg);
+		}
+	}
+
+	pxiSendAndReceive(PXI_CAMERA, CAM_MIC_STOP);
+	pmMicSetAmp(false, 0);
+	micDrain(); // pick up the last completed buffers
+	while(cameraTransferActive())
+		swiWaitForVBlank();
+	cameraTransferStop();
+
+	// Let the worker finish the remaining chunks, then patch the totals.
+	uiStatus("SAVING...");
+	while(JOBS_PENDING)
+		swiWaitForVBlank();
+	hdr[8] = frameIdx;                            // timeline length in frames (incl. dropped slots)
+	hdr[9] = (s_audBlockIdx * MIC_BUF_BYTES) / 2; // total samples
+	fseek(f, 0, SEEK_SET);
+	fwrite(hdr, sizeof(hdr), 1, f);
+	fclose(f);
+	s_vidFile = NULL;
+
+	// Thumbnail from the last viewfinder frame (RGB555 downscale).
+	u16 thumb[THUMB_W * THUMB_H];
+	for(int y = 0; y < THUMB_H; y++)
+		for(int x = 0; x < THUMB_W; x++)
+			thumb[y * THUMB_W + x] = gfx[(y * VID_H / THUMB_H) * 256 + x * VID_W / THUMB_W];
+	vidThumbPath(path, num);
+	f = fopen(path, "wb");
+	if(f) {
+		fwrite(thumb, 1, sizeof(thumb), f);
+		fclose(f);
+	}
+
+	char msg[36];
+	sprintf(msg, "SAVED VID_%04d%s", num, framesDropped ? " (DROPPED FRAMES)" : "");
+	uiStatus(msg);
+	if(s_audDropped)
+		uiStatus("SAVED VID (DROPPED AUDIO)");
+	uiSpace();
 }
 
 // Fallback numbering for Album export when pit.bin is unusable.
@@ -329,15 +765,24 @@ static bool exportToAlbum(int num) {
 
 // Soft delete: photos move to /photos/trash (never erased); pull them off the
 // card or move them back by hand to restore.
-static void softDelete(int num) {
+static void softDelete(int num, bool isVideo) {
 	char from[40], to[52];
 	mkdir(RAW_DIR "/trash", 0777);
-	rawPath(from, num);
-	sprintf(to, RAW_DIR "/trash/IMG_%04d.YUV", num);
-	rename(from, to);
-	thumbPath(from, num);
-	sprintf(to, RAW_DIR "/trash/IMG_%04d.THM", num);
-	rename(from, to);
+	if(isVideo) {
+		vidPath(from, num);
+		sprintf(to, RAW_DIR "/trash/VID_%04d.VID", num);
+		rename(from, to);
+		vidThumbPath(from, num);
+		sprintf(to, RAW_DIR "/trash/VID_%04d.THM", num);
+		rename(from, to);
+	} else {
+		rawPath(from, num);
+		sprintf(to, RAW_DIR "/trash/IMG_%04d.YUV", num);
+		rename(from, to);
+		thumbPath(from, num);
+		sprintf(to, RAW_DIR "/trash/IMG_%04d.THM", num);
+		rename(from, to);
+	}
 }
 
 // Waits for A (true) or B (false).
@@ -354,9 +799,12 @@ static bool confirmAB(void) {
 }
 
 // Loads (or builds and caches) the 64x48 thumbnail for a photo.
-static void getThumb(int num, u16 *out) {
+static void getThumb(int num, bool isVideo, u16 *out) {
 	char path[40];
-	thumbPath(path, num);
+	if(isVideo)
+		vidThumbPath(path, num);
+	else
+		thumbPath(path, num);
 	FILE *f = fopen(path, "rb");
 	if(f) {
 		fread(out, 1, THUMB_W * THUMB_H * 2, f);
@@ -366,6 +814,8 @@ static void getThumb(int num, u16 *out) {
 
 	// No cache (photo from an older build): build it from the raw.
 	memset(out, 0, THUMB_W * THUMB_H * 2);
+	if(isVideo)
+		return; // videos always have a cache (written at record stop)
 	rawPath(path, num);
 	f = fopen(path, "rb");
 	if(!f)
@@ -513,13 +963,34 @@ static void uiKey(int y, const char *key, const char *action) {
 	uiText(126, y, action, UI_FG);
 }
 
+// Free/total SD space, drawn just under the camera name. Safe to call from
+// the worker thread; it only touches its own strip.
+void uiSpace(void) {
+	struct statvfs sv;
+	uiRect(0, 58, 256, 10, UI_BG);
+	if(statvfs("/", &sv) != 0 || !sv.f_blocks)
+		return;
+	u64 freeB = (u64)sv.f_bavail * sv.f_frsize;
+	u64 totB  = (u64)sv.f_blocks * sv.f_frsize;
+	char s[32];
+	sprintf(s, "%.1f GB FREE OF %.1f", (double)freeB / 1e9, (double)totB / 1e9);
+	uiTextCenter(58, s, UI_DIM);
+}
+
 static void uiCameraScreen(int cam, bool fatInited) {
 	uiHeader("DSI CAMERA");
 	uiTextCenter(44, cam == CAM_INNER ? "INNER CAMERA" : "OUTER CAMERA", UI_DIM);
+	uiSpace();
 
-	int y = 76;
+	int y = 82;
 	if(fatInited) {
-		uiKey(y, "L/R", "TAKE PHOTOS");
+		if(s_videoMode) {
+			uiKey(y, "L/R", "RECORD VIDEO");
+			uiKey(y += 16, "Y", "PHOTO MODE");
+		} else {
+			uiKey(y, "L/R", "TAKE PHOTOS");
+			uiKey(y += 16, "Y", "VIDEO MODE");
+		}
 		uiKey(y += 16, "A", "SWAP CAMERA");
 		uiKey(y += 16, "SELECT", "ALBUM");
 	} else {
@@ -591,6 +1062,7 @@ static void hline(u16 *gfx, int x, int y, int w, u16 col) {
 
 static void composeAlbum(u16 *gfx,
 						 int count,
+						 const Photo *ph,
 						 const u16 *thumbs,
 						 const Section *sec,
 						 int nsec,
@@ -617,6 +1089,11 @@ static void composeAlbum(u16 *gfx,
 			int yy = dy + y;
 			if(yy >= 0 && yy < SCREEN_H)
 				memcpy(gfx + yy * 256 + px[i], thumbs + i * THUMB_W * THUMB_H + y * THUMB_W, THUMB_W * 2);
+		}
+		// Play marker on videos: ">" bottom-right of the cell.
+		if(ph[i].isVideo) {
+			char m[2] = ">";
+			drawText(gfx, px[i] + THUMB_W - 8, dy + THUMB_H - 9, m, BIT(15) | RGB15(31, 31, 31));
 		}
 	}
 
@@ -699,12 +1176,25 @@ static bool fullView(u16 *gfx, const Photo *ph, int count, int *idx) {
 	while(!pmShouldReset()) {
 		if(dirty) {
 			char path[40];
-			rawPath(path, ph[*idx].num);
-			FILE *f = fopen(path, "rb");
-			if(f) {
-				fread(yuv, 1, RAW_SIZE, f);
-				fclose(f);
-				blitYuv(yuv, gfx);
+			if(ph[*idx].isVideo) {
+				// Show the video's first frame.
+				vidPath(path, ph[*idx].num);
+				FILE *f = fopen(path, "rb");
+				if(f && vidReadFirstFrame(f, gfx)) {
+					fclose(f);
+				} else {
+					if(f)
+						fclose(f);
+					memset(gfx, 0, 256 * 192 * 2);
+				}
+			} else {
+				rawPath(path, ph[*idx].num);
+				FILE *f = fopen(path, "rb");
+				if(f) {
+					fread(yuv, 1, RAW_SIZE, f);
+					fclose(f);
+					blitYuv(yuv, gfx);
+				}
 			}
 			char when[40], line[40];
 			struct tm *lt = localtime(&ph[*idx].ts);
@@ -712,14 +1202,17 @@ static bool fullView(u16 *gfx, const Photo *ph, int count, int *idx) {
 				strftime(when, sizeof(when), "%b %d, %Y  %H:%M", lt);
 			else
 				strcpy(when, "UNKNOWN DATE");
-			sprintf(line, "IMG_%04d", ph[*idx].num);
+			sprintf(line, "%s_%04d", ph[*idx].isVideo ? "VID" : "IMG", ph[*idx].num);
 			uiHeader(line);
 			uiTextCenter(44, when, UI_DIM);
 			sprintf(line, "%d/%d", *idx + 1, count);
 			uiTextCenter(58, line, UI_DIM);
 			int y = 88;
 			uiKey(y, "< >", "BROWSE");
-			uiKey(y += 16, "A", "SEND TO DSI ALBUM");
+			if(ph[*idx].isVideo)
+				uiKey(y += 16, "A", "PLAY");
+			else
+				uiKey(y += 16, "A", "SEND TO DSI ALBUM");
 			uiKey(y += 16, "X", "DELETE");
 			uiKey(y += 16, "B", "BACK");
 			dirty = false;
@@ -740,13 +1233,18 @@ static bool fullView(u16 *gfx, const Photo *ph, int count, int *idx) {
 			*idx  = (*idx + 1) % count;
 			dirty = true;
 		} else if(pressed & KEY_A) {
-			uiStatus("EXPORTING...");
-			uiStatus(exportToAlbum(ph[*idx].num) ? "SENT TO DSI ALBUM" : "EXPORT FAILED");
+			if(ph[*idx].isVideo) {
+				playVideo(gfx, ph[*idx].num);
+				dirty = true; // redraw the still + info afterwards
+			} else {
+				uiStatus("EXPORTING...");
+				uiStatus(exportToAlbum(ph[*idx].num) ? "SENT TO DSI ALBUM" : "EXPORT FAILED");
+			}
 		} else if(pressed & KEY_X) {
 			char msg[32];
-			sprintf(msg, "DELETE IMG_%04d?", ph[*idx].num);
+			sprintf(msg, "DELETE %s_%04d?", ph[*idx].isVideo ? "VID" : "IMG", ph[*idx].num);
 			if(uiConfirm(msg)) {
-				softDelete(ph[*idx].num);
+				softDelete(ph[*idx].num, ph[*idx].isVideo);
 				deleted = true;
 				break;
 			}
@@ -794,7 +1292,7 @@ static void viewer(u16 *gfx, int cam) {
 		uiHeader("ALBUM");
 		uiStatus("LOADING...");
 		for(int i = 0; i < count; i++)
-			getThumb(ph[i].num, thumbs + i * THUMB_W * THUMB_H);
+			getThumb(ph[i].num, ph[i].isVideo, thumbs + i * THUMB_W * THUMB_H);
 
 		int scroll = maxScroll, target = maxScroll;
 		bool dirty = true, infoDirty = true, reload = false;
@@ -858,9 +1356,9 @@ static void viewer(u16 *gfx, int cam) {
 					if(nMarked) {
 						for(int i = 0; i < count; i++)
 							if(marked[i])
-								softDelete(ph[i].num);
+								softDelete(ph[i].num, ph[i].isVideo);
 					} else {
-						softDelete(ph[sel].num);
+						softDelete(ph[sel].num, ph[sel].isVideo);
 					}
 					reload = true;
 				}
@@ -888,7 +1386,7 @@ static void viewer(u16 *gfx, int cam) {
 			}
 
 			if(dirty || sel != prevSel) {
-				composeAlbum(gfx, count, thumbs, sec, nsec, px, py, scroll, sel, marked);
+				composeAlbum(gfx, count, ph, thumbs, sec, nsec, px, py, scroll, sel, marked);
 				dirty = scroll != target;
 			}
 
@@ -958,13 +1456,30 @@ int main(int argc, char **argv) {
 		if(tdir) {
 			struct dirent *pent;
 			while((pent = readdir(tdir))) {
-				if(strncmp(pent->d_name, "IMG_", 4) != 0)
+				if(strncmp(pent->d_name, "IMG_", 4) != 0 && strncmp(pent->d_name, "VID_", 4) != 0)
 					continue;
 				int val = atoi(pent->d_name + 4);
-				if(val >= s_nextRawNum)
+				if(pent->d_name[0] == 'V') {
+					if(val >= s_nextVidNum)
+						s_nextVidNum = val + 1;
+				} else if(val >= s_nextRawNum) {
 					s_nextRawNum = val + 1;
+				}
 			}
 			closedir(tdir);
+		}
+		// Video numbering continues past the highest VID_ file.
+		DIR *vdir = opendir(RAW_DIR);
+		if(vdir) {
+			struct dirent *pent;
+			while((pent = readdir(vdir))) {
+				if(strncmp(pent->d_name, "VID_", 4) == 0) {
+					int val = atoi(pent->d_name + 4);
+					if(val >= s_nextVidNum)
+						s_nextVidNum = val + 1;
+				}
+			}
+			closedir(vdir);
 		}
 	} else {
 		uiStatus("NO SD CARD");
@@ -973,6 +1488,7 @@ int main(int argc, char **argv) {
 	uiStatus("INITIALIZING...");
 	pxiWaitRemote(PXI_CAMERA); // Wait for ARM7 to initialize PXI
 	cameraInit();
+	soundInit(); // ARM9 interface to the ARM7 sound driver (video playback)
 
 	// Fetch the 16-byte camera signing key from the ARM7 (it read it from the
 	// BIOS-populated WRAM at boot), as 8 halfwords because PXI immediates are
@@ -1033,13 +1549,26 @@ int main(int argc, char **argv) {
 			cameraActivate(camera);
 
 			uiCameraScreen(camera, fatInited);
+		} else if(fatInited && pressed & KEY_Y) {
+			s_videoMode = !s_videoMode;
+			uiCameraScreen(camera, fatInited);
 		} else if(fatInited && pressed & (KEY_L | KEY_R)) {
-			// Hold L/R to keep taking photos continuously.
-			do {
-				captureRaw(gfx);
-				scanKeys();
-				// Don't keep shooting into a closed lid (e.g. in a pocket).
-			} while((keysHeld() & (KEY_L | KEY_R)) && !(keysHeld() & KEY_LID));
+			if(s_videoMode) {
+				// Tap L/R to record, tap again to stop.
+				while(cameraTransferActive())
+					swiWaitForVBlank();
+				drainJobs(); // finish any pending photo writes first
+				recordVideo(gfx, s_nextVidNum++);
+				uiCameraScreen(camera, fatInited);
+			} else {
+				// Hold L/R to keep taking photos continuously.
+				do {
+					captureRaw(gfx);
+					scanKeys();
+					// Don't keep shooting into a closed lid (e.g. in a pocket).
+				} while((keysHeld() & (KEY_L | KEY_R)) && !(keysHeld() & KEY_LID));
+				uiSpace(); // refresh the free-space line after the burst
+			}
 		} else if(fatInited && pressed & KEY_SELECT) {
 			// Stop the live preview and browse photos.
 			while(cameraTransferActive())
