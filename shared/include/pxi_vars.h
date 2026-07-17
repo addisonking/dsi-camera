@@ -33,7 +33,11 @@ typedef enum {
 	CAM_MIC_ADDR_LO,
 	CAM_MIC_ADDR_HI,
 	CAM_MIC_START,
-	CAM_MIC_STOP
+	CAM_MIC_STOP,
+	// Camera LED (BPTWL reg 0x31) as shutter feedback.
+	CAM_LED_OFF,
+	CAM_LED_ON,
+	CAM_LED_BLINK
 } PxiCommand;
 
 // Mic ring layout: u32 completion counter at the base, then MIC_RING_BUFS

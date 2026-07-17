@@ -579,6 +579,7 @@ static void recordVideo(u16 *gfx, int num) {
 	pxiSendAndReceive(PXI_CAMERA, CAM_MIC_ADDR_HI);
 	pxiSendAndReceive(PXI_CAMERA, micAddr >> 16);
 	pxiSendAndReceive(PXI_CAMERA, CAM_MIC_START);
+	pxiSendAndReceive(PXI_CAMERA, CAM_LED_BLINK); // recording indicator
 
 	// Paced by vblank count (~59.8Hz): keep a frame every keepEvery vblanks.
 	u32 vbl       = 0;
@@ -636,6 +637,7 @@ static void recordVideo(u16 *gfx, int num) {
 	}
 
 	pxiSendAndReceive(PXI_CAMERA, CAM_MIC_STOP);
+	pxiSendAndReceive(PXI_CAMERA, CAM_LED_OFF);
 	pmMicSetAmp(false, 0);
 	micDrain(); // pick up the last completed buffers
 	while(cameraTransferActive())
@@ -1548,12 +1550,15 @@ int main(int argc, char **argv) {
 				recordVideo(gfx, s_nextVidNum++);
 				uiCameraScreen(camera, fatInited);
 			} else {
-				// Hold L/R to keep taking photos continuously.
+				// Hold L/R to keep taking photos continuously. Camera LED
+				// lights while shooting, like a shutter indicator.
+				pxiSendAndReceive(PXI_CAMERA, CAM_LED_ON);
 				do {
 					captureRaw(gfx);
 					scanKeys();
 					// Don't keep shooting into a closed lid (e.g. in a pocket).
 				} while((keysHeld() & (KEY_L | KEY_R)) && !(keysHeld() & KEY_LID));
+				pxiSendAndReceive(PXI_CAMERA, CAM_LED_OFF);
 				uiSpace(); // refresh the free-space line after the burst
 			}
 		} else if(fatInited && pressed & KEY_SELECT) {

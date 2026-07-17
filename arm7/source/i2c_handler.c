@@ -5,6 +5,9 @@
 
 #include <nds.h>
 
+#include <calico/nds/arm7/i2c.h>
+#include <calico/nds/arm7/mcu.h>
+
 // Management structure and stack space for PXI server thread
 Thread s_i2cPxiThread;
 alignas(8) u8 s_i2cPxiThreadStack[1024];
@@ -182,6 +185,14 @@ int i2cPxiThreadMain(void *arg) {
 			case CAM_MIC_STOP:
 				micStop();
 				retval = CAM_MIC_STOP;
+				break;
+			case CAM_LED_OFF:
+			case CAM_LED_ON:
+			case CAM_LED_BLINK:
+				i2cLock();
+				i2cWriteRegister8(I2cDev_MCU, McuReg_CamLed, msg - CAM_LED_OFF);
+				i2cUnlock();
+				retval = msg;
 				break;
 			default:
 				// Halfword following CAM_MIC_ADDR_LO/HI: the ring address.
