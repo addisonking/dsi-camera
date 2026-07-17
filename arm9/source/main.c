@@ -359,14 +359,15 @@ static void captureRaw(u16 *previewGfx) {
 }
 
 // --- Video playback: audio streams through a looping ring while frames are
-// --- blitted at their pacing-slot times. One 16kHz timer is the single A/V
-// --- clock, so sound and picture can't drift apart.
+// --- blitted at their pacing-slot times. Hardware timer 0 free-runs at
+// --- BUS_CLOCK/1024 and is the single A/V clock (polled via timerElapsed, no
+// --- ISR); it and the sound channel derive from the same crystal, so sound
+// --- and picture can't drift apart.
 
 #define PLAY_RING_HALF 8192 // samples per ring half (16KB)
+#define PLAY_TIMER_HZ (BUS_CLOCK >> 10)
 alignas(32) static s16 s_playRing[2 * PLAY_RING_HALF];
-static vu32 s_playTicks;
-
-static void playTickIsr(void) { s_playTicks++; }
+static u32 s_playTicks;
 
 // Reads the next chunk of `wantType` from f, skipping over chunks of the other
 // type. Returns false at EOF/corruption.
@@ -468,7 +469,8 @@ static void playVideo(u16 *gfx, int num) {
 					s_playRing,
 					0,
 					sizeof(s_playRing) / 4);
-	timerStart(0, ClockDivider_64, TIMER_FREQ_64(rate), playTickIsr);
+	timerStart(0, ClockDivider_1024, 0, NULL); // free-running counter
+	timerElapsed(0);                           // zero the baseline
 
 	u32 durSec = totalFrames / fps;
 	if(totalSamples / rate > durSec)
@@ -481,7 +483,8 @@ static void playVideo(u16 *gfx, int num) {
 		if(keysDown() & (KEY_B | KEY_A | KEY_START | KEY_SELECT) || (keysHeld() & KEY_LID) || pmShouldReset())
 			break;
 
-		u32 played       = s_playTicks;
+		s_playTicks += timerElapsed(0);
+		u32 played       = (u32)((u64)s_playTicks * rate / PLAY_TIMER_HZ);
 		u32 playedHalves = played / PLAY_RING_HALF;
 
 		// Keep the ring filled one half ahead of playback.
