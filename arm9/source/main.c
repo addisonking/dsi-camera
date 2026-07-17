@@ -1,24 +1,31 @@
 #include "camera.h"
-#include "lodepng.h"
 #include "version.h"
 
 #include <calico/nds/pm.h>
 #include <calico/nds/pxi.h>
+#include <calico/system/mailbox.h>
+#include <calico/system/thread.h>
 #include <dirent.h>
 #include <fat.h>
 #include <math.h>
 #include <nds.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <time.h>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h"
-#include "exif.h"
 #include "dsi_photo.h"
 #include "pit.h"
+#include "stb_image_write.h"
 
-#define PHOTO_DIR "/DCIM/100NIN02"
+// Photos are captured as raw YUV422 dumps (no encoding, instant save) and
+// browsed with the built-in viewer. Exporting to the stock DSi Album (JPEG +
+// signature + pit.bin) is done on demand from the viewer.
+#define RAW_DIR "/photos"
+#define RAW_SIZE (640 * 480 * 2)
+#define EXPORT_FALLBACK_DIR "/DCIM/100NIN02"
 
 #define YUV_TO_R(Y, Cr) clamp(Y + Cr + (Cr >> 2) + (Cr >> 3) + (Cr >> 5), 0, 0xFF)
 #define YUV_TO_G(Y, Cb, Cr) \
@@ -27,146 +34,657 @@
 
 int clamp(int val, int min, int max) { return val < min ? min : (val > max ? max : val); }
 
-int getImageNumber() {
-	int highest = 0;
+// Draws a raw 640x480 YUV422 frame downscaled (nearest-neighbour) to a
+// dw x dh RGB555 image in `dst` with row stride `stride`.
+static void blitYuvScaled(const u16 *yuv, u16 *dst, int stride, int dw, int dh) {
+	for(int y = 0; y < dh; y++) {
+		int sy = (y * 480) / dh;
+		for(int x = 0; x < dw; x++) {
+			int sx  = (x * 640) / dw & ~1; // keep YUV pair alignment
+			u8 *val = (u8 *)(yuv + sy * 640 + sx);
+			int Y   = val[(x & 1) ? 2 : 0];
+			int Cb  = val[1] - 0x80;
+			int Cr  = val[3] - 0x80;
+			int r   = YUV_TO_R(Y, Cr) >> 3;
+			int g   = YUV_TO_G(Y, Cb, Cr) >> 3;
+			int b   = YUV_TO_B(Y, Cb) >> 3;
+			// NDS 16-bit bitmap is aBBBBBGGGGGRRRRR (blue high, red low)
+			dst[y * stride + x] = BIT(15) | (b << 10) | (g << 5) | r;
+		}
+	}
+}
 
-	mkdir("/DCIM", 0777);
-	mkdir(PHOTO_DIR, 0777);
+static void blitYuv(const u16 *yuv, u16 *gfx) { blitYuvScaled(yuv, gfx, 256, 256, 192); }
 
-	DIR *pdir = opendir(PHOTO_DIR);
-	if(pdir == NULL) {
-		printf("Unable to open directory");
-		return 1;
-	} else {
-		while(true) {
-			struct dirent *pent = readdir(pdir);
-			if(pent == NULL)
-				break;
+static void yuvToRgb(const u16 *yuv, u8 *rgb) {
+	for(int py = 0; py < 480; py++) {
+		for(int px = 0; px < 640; px += 2) {
+			u8 *val = (u8 *)(yuv + py * 640 + px);
+			int Y1  = val[0];
+			int Cb  = val[1] - 0x80;
+			int Y2  = val[2];
+			int Cr  = val[3] - 0x80;
 
-			if(strncmp(pent->d_name, "HNI_", 4) == 0) {
-				int val = atoi(pent->d_name + 4);
-				if(val > highest)
-					highest = val;
-			}
+			u8 *dst = rgb + py * (640 * 3) + px * 3;
+			dst[0]  = YUV_TO_R(Y1, Cr);
+			dst[1]  = YUV_TO_G(Y1, Cb, Cr);
+			dst[2]  = YUV_TO_B(Y1, Cb);
+			dst[3]  = YUV_TO_R(Y2, Cr);
+			dst[4]  = YUV_TO_G(Y2, Cb, Cr);
+			dst[5]  = YUV_TO_B(Y2, Cb);
+		}
+	}
+}
+
+static void rawPath(char *out, int num) { sprintf(out, RAW_DIR "/IMG_%04d.YUV", num); }
+static void thumbPath(char *out, int num) { sprintf(out, RAW_DIR "/IMG_%04d.THM", num); }
+
+// Album grid layout: 4x3 cells of 64x48 thumbnails (raw RGB555, cached as
+// .THM files beside the raws so the grid doesn't have to read 600KB per cell).
+#define THUMB_W 64
+#define THUMB_H 48
+#define GRID_COLS 4
+#define GRID_ROWS 3
+#define GRID_PER_PAGE (GRID_COLS * GRID_ROWS)
+
+typedef struct Photo {
+	int num;
+	time_t ts; // capture time = the raw file's FAT mtime
+} Photo;
+
+static int cmpPhoto(const void *a, const void *b) {
+	const Photo *x = (const Photo *)a, *y = (const Photo *)b;
+	if(x->ts != y->ts)
+		return x->ts < y->ts ? -1 : 1;
+	return x->num - y->num;
+}
+
+// List of the photos in RAW_DIR, sorted oldest-first. Caller frees *outPhotos.
+static int scanRaw(Photo **outPhotos) {
+	int cap = 64, count = 0;
+	Photo *ph = (Photo *)malloc(cap * sizeof(Photo));
+
+	DIR *pdir = opendir(RAW_DIR);
+	if(pdir) {
+		struct dirent *pent;
+		while((pent = readdir(pdir))) {
+			if(strncmp(pent->d_name, "IMG_", 4) != 0 || !strstr(pent->d_name, ".YUV"))
+				continue;
+			if(count == cap)
+				ph = (Photo *)realloc(ph, (cap *= 2) * sizeof(Photo));
+			ph[count].num = atoi(pent->d_name + 4);
+			char path[40];
+			rawPath(path, ph[count].num);
+			struct stat st;
+			ph[count].ts = stat(path, &st) == 0 ? st.st_mtime : 0;
+			count++;
 		}
 		closedir(pdir);
 	}
 
-	return highest + 1;
+	qsort(ph, count, sizeof(Photo), cmpPhoto);
+	*outPhotos = ph;
+	return count;
 }
 
-// Captures one full-res frame from the active camera and saves it as a signed,
-// Album-compatible DSi JPEG. Assumes a transfer may be in progress (waits for it).
-// `previewGfx` is the top-screen bitmap (256-wide); the captured frame is drawn
-// to it so the preview keeps updating during a burst.
-void captureAndSave(u16 *previewGfx) {
-	printf("Capturing... ");
+static int dayKey(time_t t) {
+	struct tm *lt = localtime(&t);
+	return lt ? lt->tm_year * 1000 + lt->tm_yday : 0;
+}
 
+// Async save pipeline: the main thread captures raw YUV frames and queues
+// them here; a lower-priority worker thread writes them to SD in the
+// background so burst shots are only limited by capture time.
+typedef struct FrameJob {
+	u16 *yuv;
+	int num;
+} FrameJob;
+
+#define JOB_QUEUE_LEN 8 // ~600KB per raw frame, so ~4.8MB queued at most
+
+static Thread s_workerThread;
+alignas(8) static u8 s_workerStack[32 * 1024];
+static Mailbox s_jobMailbox;
+static u32 s_jobSlots[JOB_QUEUE_LEN];
+// Single-writer counters (main queues, worker finishes) so no atomics needed.
+static vu32 s_jobsQueued = 0;
+static vu32 s_jobsDone   = 0;
+#define JOBS_PENDING (s_jobsQueued - s_jobsDone)
+
+static int s_nextRawNum = 1;
+static u8 s_camKey[16];
+
+static int workerMain(void *arg) {
+	for(;;) {
+		FrameJob *job = (FrameJob *)mailboxRecv(&s_jobMailbox);
+
+		char path[40];
+		rawPath(path, job->num);
+		FILE *f = fopen(path, "wb");
+		if(f) {
+			fwrite(job->yuv, 1, RAW_SIZE, f);
+			fclose(f);
+			printf("Saved IMG_%04d\n", job->num);
+		} else {
+			printf("Write failed: %s\n", path);
+		}
+
+		// Thumbnail cache for the album grid.
+		u16 thumb[THUMB_W * THUMB_H];
+		blitYuvScaled(job->yuv, thumb, THUMB_W, THUMB_W, THUMB_H);
+		thumbPath(path, job->num);
+		f = fopen(path, "wb");
+		if(f) {
+			fwrite(thumb, 1, sizeof(thumb), f);
+			fclose(f);
+		}
+
+		free(job->yuv);
+		free(job);
+		s_jobsDone++;
+	}
+	return 0;
+}
+
+// Blocks until every queued frame has been written out. Call before exiting,
+// sleeping, or opening the viewer so the photo list is complete.
+static void drainJobs(void) {
+	if(JOBS_PENDING)
+		printf("Finishing %lu photo(s)...\n", (unsigned long)JOBS_PENDING);
+	while(JOBS_PENDING)
+		swiWaitForVBlank();
+}
+
+// Captures one full-res frame and queues it for background saving. Blocks
+// only for the capture DMA itself (or for a queue slot if the SD card is
+// >JOB_QUEUE_LEN frames behind). `previewGfx` is the top-screen bitmap; the
+// frame is drawn to it so the preview updates during a burst.
+static void captureRaw(u16 *previewGfx) {
 	// Wait for previous transfer to finish
 	while(cameraTransferActive())
 		swiWaitForVBlank();
 
-	// Get image
-	u16 *yuv = (u16 *)malloc(640 * 480 * sizeof(u16));
+	u16 *yuv      = NULL;
+	FrameJob *job = NULL;
+	for(;;) {
+		if(!yuv)
+			yuv = (u16 *)malloc(RAW_SIZE);
+		if(!job)
+			job = (FrameJob *)malloc(sizeof(FrameJob));
+		if(yuv && job)
+			break;
+		// Out of RAM: let the worker finish a frame and retry.
+		swiWaitForVBlank();
+	}
+
 	cameraTransferStart(yuv, CAPTURE_MODE_CAPTURE);
 	while(cameraTransferActive())
 		swiWaitForVBlank();
 	cameraTransferStop();
 
-	// Show the frame we just grabbed (nearest-neighbour 640x480 -> 256x192) so
-	// the preview isn't frozen while we encode/sign during a burst. Capture
-	// mode outputs raw YUV422, so convert to RGB555 here (the live preview uses
-	// the camera's hardware YUV->RGB555, but capture bypasses it).
-	if(previewGfx) {
-		for(int y = 0; y < 192; y++) {
-			int sy = (y * 480) / 192;
-			for(int x = 0; x < 256; x++) {
-				int sx = (x * 640) / 256 & ~1; // keep YUV pair alignment
-				u8 *val = (u8 *)(yuv + sy * 640 + sx);
-				int Y = val[(x & 1) ? 2 : 0];
-				int Cb = val[1] - 0x80;
-				int Cr = val[3] - 0x80;
-				int r = YUV_TO_R(Y, Cr) >> 3;
-				int g = YUV_TO_G(Y, Cb, Cr) >> 3;
-				int b = YUV_TO_B(Y, Cb) >> 3;
-				// NDS 16-bit bitmap is aBBBBBGGGGGRRRRR (blue high, red low)
-				previewGfx[y * 256 + x] = BIT(15) | (b << 10) | (g << 5) | r;
-			}
+	// The sensor's first scanline carries garbage/embedded data (shows up as
+	// green speckles); paper over it with the second line.
+	memcpy(yuv, yuv + 640, 640 * sizeof(u16));
+
+	if(previewGfx)
+		blitYuv(yuv, previewGfx);
+
+	job->yuv = yuv;
+	job->num = s_nextRawNum++;
+	while(!mailboxTrySend(&s_jobMailbox, (u32)job))
+		swiWaitForVBlank(); // queue full, wait for the worker
+	s_jobsQueued++;
+}
+
+// Fallback numbering for Album export when pit.bin is unusable.
+static int getExportNumber(void) {
+	int highest = 0;
+	DIR *pdir   = opendir(EXPORT_FALLBACK_DIR);
+	if(!pdir)
+		return 1;
+	struct dirent *pent;
+	while((pent = readdir(pdir))) {
+		if(strncmp(pent->d_name, "HNI_", 4) == 0) {
+			int val = atoi(pent->d_name + 4);
+			if(val > highest)
+				highest = val;
 		}
 	}
+	closedir(pdir);
+	return highest + 1;
+}
 
-	printf("Done!\nSaving JPEG... ");
+// Converts one raw photo to a signed, Album-compatible DSi JPEG, registers it
+// in pit.bin and saves it under DCIM. Slow (several seconds): JPEG encoding.
+static bool exportToAlbum(int num) {
+	char path[40];
+	rawPath(path, num);
 
-	// YUV422 -> RGB
+	FILE *f = fopen(path, "rb");
+	if(!f)
+		return false;
+	u16 *yuv = (u16 *)malloc(RAW_SIZE);
+	fread(yuv, 1, RAW_SIZE, f);
+	fclose(f);
+
+	// Photo timestamp = the raw file's FAT mtime (set when it was captured).
+	struct stat st;
+	time_t t = (stat(path, &st) == 0 && st.st_mtime > 0) ? st.st_mtime : time(NULL);
+
 	u8 *rgb = (u8 *)malloc(640 * 480 * 3);
-	for(int py = 0; py < 480; py++) {
-		for(int px = 0; px < 640; px += 2) {
-			u8 *val = (u8 *)(yuv + py * 640 + px);
-
-			// Get YUV values
-			int Y1 = val[0];
-			int Cb = val[1] - 0x80;
-			int Y2 = val[2];
-			int Cr = val[3] - 0x80;
-
-			u8 *dst = rgb + py * (640 * 3) + px * 3;
-			// First pixel R, G, B
-			dst[0] = YUV_TO_R(Y1, Cr);
-			dst[1] = YUV_TO_G(Y1, Cb, Cr);
-			dst[2] = YUV_TO_B(Y1, Cb);
-			// Second pixel R, G, B
-			dst[3] = YUV_TO_R(Y2, Cr);
-			dst[4] = YUV_TO_G(Y2, Cb, Cr);
-			dst[5] = YUV_TO_B(Y2, Cb);
-		}
-	}
+	yuvToRgb(yuv, rgb);
 	free(yuv);
 
-	// Fetch the 16-byte camera signing key from the ARM7 (it read it from the
-	// BIOS-populated WRAM at boot), as 8 halfwords because PXI immediates are
-	// only 26-bit (full words would be truncated).
-	u8 key[16];
-	u16 *kh = (u16 *)key;
-	for(int i = 0; i < 8; i++)
-		kh[i] = pxiSendAndReceive(PXI_CAMERA, CAM_GET_KEY0 + i);
-
-	// Exif date/time string (falls back if the RTC isn't synced).
 	char dt[20];
-	time_t t = time(NULL);
 	struct tm *tmv = localtime(&t);
 	if(tmv && tmv->tm_year > 100)
 		strftime(dt, sizeof(dt), "%Y:%m:%d %H:%M:%S", tmv);
 	else
 		strcpy(dt, "2024:01:01 00:00:00");
 
-	// Register the photo in the DSi Camera index (pit.bin) so the stock Album
-	// shows it with the right timestamp, and use its counter for the filename.
-	// Falls back to a directory scan if pit.bin is missing/unwritable.
-	u32 dsiTs = (u32)((u32)t - 946684800u); // seconds 1970->2000 epoch shift
-	int imgNum = pitAddPhoto(dsiTs);
+	u32 dsiTs  = (u32)((u32)t - 946684800u); // seconds 1970->2000 epoch shift
+	int folder = 100;
+	int imgNum = pitAddPhoto(dsiTs, &folder);
 	if(imgNum < 0)
-		imgNum = getImageNumber();
+		imgNum = getExportNumber();
 
 	// Nonce is stored in the file (not secret); just make it vary.
 	u8 nonce[12];
 	for(int i = 0; i < 12; i++)
 		nonce[i] = (u8)(t >> ((i & 3) * 8)) ^ (u8)(imgNum * (i + 1));
 
-	u8 *photo = NULL;
+	u8 *photo    = NULL;
 	int photoLen = 0;
-	buildAndSignDsiPhoto(rgb, dt, key, nonce, &photo, &photoLen);
+	buildAndSignDsiPhoto(rgb, dt, s_camKey, nonce, &photo, &photoLen);
 	free(rgb);
 
-	char imgName[40];
-	sprintf(imgName, PHOTO_DIR "/HNI_%04d.JPG", imgNum);
-	FILE *f = fopen(imgName, "wb");
+	char jpgName[40];
+	sprintf(jpgName, "/DCIM/%03dNIN02", folder);
+	mkdir(jpgName, 0777);
+	sprintf(jpgName, "/DCIM/%03dNIN02/HNI_%04d.JPG", folder, imgNum);
+	f       = fopen(jpgName, "wb");
+	bool ok = f != NULL;
 	if(f) {
 		fwrite(photo, 1, photoLen, f);
 		fclose(f);
 	}
 	free(photo);
 
-	printf("Done!\nSaved to:\n%s\n\n", imgName);
+	if(ok)
+		printf("Exported to %s\n", jpgName);
+	return ok;
+}
+
+// Loads (or builds and caches) the 64x48 thumbnail for a photo.
+static void getThumb(int num, u16 *out) {
+	char path[40];
+	thumbPath(path, num);
+	FILE *f = fopen(path, "rb");
+	if(f) {
+		fread(out, 1, THUMB_W * THUMB_H * 2, f);
+		fclose(f);
+		return;
+	}
+
+	// No cache (photo from an older build): build it from the raw.
+	memset(out, 0, THUMB_W * THUMB_H * 2);
+	rawPath(path, num);
+	f = fopen(path, "rb");
+	if(!f)
+		return;
+	u16 *yuv = (u16 *)malloc(RAW_SIZE);
+	fread(yuv, 1, RAW_SIZE, f);
+	fclose(f);
+	blitYuvScaled(yuv, out, THUMB_W, THUMB_W, THUMB_H);
+	free(yuv);
+
+	thumbPath(path, num);
+	f = fopen(path, "wb");
+	if(f) {
+		fwrite(out, 1, THUMB_W * THUMB_H * 2, f);
+		fclose(f);
+	}
+}
+
+// --- Album gallery: one continuous scrolling layout, photos in rows of 4
+// --- grouped under per-day headers, with eased scrolling.
+
+#define HEADER_H 14
+#define ROW_H (THUMB_H + 2)
+#define SECTION_GAP 4
+#define SCREEN_H 192
+
+// 5x7 pixel font (columns, LSB = top row) for the date headers; covers
+// uppercase, digits, comma and space.
+static const u8 s_font[38][5] = {
+	{0x7E, 0x11, 0x11, 0x11, 0x7E}, {0x7F, 0x49, 0x49, 0x49, 0x36}, {0x3E, 0x41, 0x41, 0x41, 0x22},
+	{0x7F, 0x41, 0x41, 0x22, 0x1C}, {0x7F, 0x49, 0x49, 0x49, 0x41}, {0x7F, 0x09, 0x09, 0x09, 0x01},
+	{0x3E, 0x41, 0x49, 0x49, 0x7A}, {0x7F, 0x08, 0x08, 0x08, 0x7F}, {0x00, 0x41, 0x7F, 0x41, 0x00},
+	{0x20, 0x40, 0x41, 0x3F, 0x01}, {0x7F, 0x08, 0x14, 0x22, 0x41}, {0x7F, 0x40, 0x40, 0x40, 0x40},
+	{0x7F, 0x02, 0x0C, 0x02, 0x7F}, {0x7F, 0x04, 0x08, 0x10, 0x7F}, {0x3E, 0x41, 0x41, 0x41, 0x3E},
+	{0x7F, 0x09, 0x09, 0x09, 0x06}, {0x3E, 0x41, 0x51, 0x21, 0x5E}, {0x7F, 0x09, 0x19, 0x29, 0x46},
+	{0x46, 0x49, 0x49, 0x49, 0x31}, {0x01, 0x01, 0x7F, 0x01, 0x01}, {0x3F, 0x40, 0x40, 0x40, 0x3F},
+	{0x1F, 0x20, 0x40, 0x20, 0x1F}, {0x3F, 0x40, 0x38, 0x40, 0x3F}, {0x63, 0x14, 0x08, 0x14, 0x63},
+	{0x07, 0x08, 0x70, 0x08, 0x07}, {0x61, 0x51, 0x49, 0x45, 0x43}, // A-Z
+	{0x3E, 0x51, 0x49, 0x45, 0x3E}, {0x00, 0x42, 0x7F, 0x40, 0x00}, {0x42, 0x61, 0x51, 0x49, 0x46},
+	{0x21, 0x41, 0x45, 0x4B, 0x31}, {0x18, 0x14, 0x12, 0x7F, 0x10}, {0x27, 0x45, 0x45, 0x45, 0x39},
+	{0x3C, 0x4A, 0x49, 0x49, 0x30}, {0x01, 0x71, 0x09, 0x05, 0x03}, {0x36, 0x49, 0x49, 0x49, 0x36},
+	{0x06, 0x49, 0x49, 0x29, 0x1E},                                // 0-9
+	{0x00, 0x50, 0x30, 0x00, 0x00}, {0x00, 0x00, 0x00, 0x00, 0x00} // comma, space
+};
+
+static const u8 *glyph(char c) {
+	if(c >= 'A' && c <= 'Z')
+		return s_font[c - 'A'];
+	if(c >= '0' && c <= '9')
+		return s_font[26 + c - '0'];
+	if(c == ',')
+		return s_font[36];
+	return s_font[37];
+}
+
+static void drawText(u16 *gfx, int x, int y, const char *s, u16 col) {
+	for(; *s && x < 250; s++, x += 6) {
+		const u8 *g = glyph(*s);
+		for(int cx = 0; cx < 5; cx++) {
+			for(int cy = 0; cy < 7; cy++) {
+				int yy = y + cy;
+				if((g[cx] >> cy & 1) && yy >= 0 && yy < SCREEN_H)
+					gfx[yy * 256 + x + cx] = col;
+			}
+		}
+	}
+}
+
+typedef struct Section {
+	int start; // first photo index
+	int y;     // header's virtual y
+	char label[24];
+} Section;
+
+// Lays out photos into rows of 4 under per-day headers. Fills px/py (virtual
+// position per photo) and *outSec/*outNsec; returns the total virtual height.
+static int buildLayout(const Photo *ph, int count, int *px, int *py, Section **outSec, int *outNsec) {
+	static const char *mon[12] = {"JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"};
+	Section *sec               = (Section *)malloc(count * sizeof(Section));
+	int ns = 0, y = 0, i = 0;
+
+	while(i < count) {
+		sec[ns].start = i;
+		sec[ns].y     = y;
+		struct tm *lt = localtime(&ph[i].ts);
+		if(lt)
+			sprintf(sec[ns].label, "%s %d, %d", mon[lt->tm_mon], lt->tm_mday, 1900 + lt->tm_year);
+		else
+			strcpy(sec[ns].label, "UNKNOWN DATE");
+		y += HEADER_H;
+
+		int dk = dayKey(ph[i].ts), col = 0;
+		while(i < count && dayKey(ph[i].ts) == dk) {
+			px[i] = col * THUMB_W;
+			py[i] = y;
+			if(++col == GRID_COLS) {
+				col = 0;
+				y += ROW_H;
+			}
+			i++;
+		}
+		if(col)
+			y += ROW_H;
+		y += SECTION_GAP;
+		ns++;
+	}
+
+	*outSec  = sec;
+	*outNsec = ns;
+	return y;
+}
+
+static void hline(u16 *gfx, int x, int y, int w, u16 col) {
+	if(y < 0 || y >= SCREEN_H)
+		return;
+	for(int i = 0; i < w; i++)
+		gfx[y * 256 + x + i] = col;
+}
+
+static void composeAlbum(u16 *gfx,
+						 int count,
+						 const u16 *thumbs,
+						 const Section *sec,
+						 int nsec,
+						 const int *px,
+						 const int *py,
+						 int scroll,
+						 int sel) {
+	u16 bgCol = BIT(15) | RGB15(3, 3, 4);
+	for(int i = 0; i < 256 * SCREEN_H; i++)
+		gfx[i] = bgCol;
+
+	for(int s = 0; s < nsec; s++) {
+		int dy = sec[s].y - scroll;
+		if(dy > -HEADER_H && dy < SCREEN_H)
+			drawText(gfx, 3, dy + 3, sec[s].label, BIT(15) | RGB15(24, 24, 26));
+	}
+
+	for(int i = 0; i < count; i++) {
+		int dy = py[i] - scroll;
+		if(dy <= -THUMB_H || dy >= SCREEN_H)
+			continue;
+		for(int y = 0; y < THUMB_H; y++) {
+			int yy = dy + y;
+			if(yy >= 0 && yy < SCREEN_H)
+				memcpy(gfx + yy * 256 + px[i], thumbs + i * THUMB_W * THUMB_H + y * THUMB_W, THUMB_W * 2);
+		}
+	}
+
+	// Selection border
+	u16 white = BIT(15) | RGB15(31, 31, 31);
+	int dy    = py[sel] - scroll;
+	hline(gfx, px[sel], dy, THUMB_W, white);
+	hline(gfx, px[sel], dy + 1, THUMB_W, white);
+	hline(gfx, px[sel], dy + THUMB_H - 2, THUMB_W, white);
+	hline(gfx, px[sel], dy + THUMB_H - 1, THUMB_W, white);
+	for(int y = 0; y < THUMB_H; y++) {
+		int yy = dy + y;
+		if(yy < 0 || yy >= SCREEN_H)
+			continue;
+		gfx[yy * 256 + px[sel]]               = white;
+		gfx[yy * 256 + px[sel] + 1]           = white;
+		gfx[yy * 256 + px[sel] + THUMB_W - 2] = white;
+		gfx[yy * 256 + px[sel] + THUMB_W - 1] = white;
+	}
+}
+
+// Moves the selection one visual row up (dir<0) or down (dir>0), keeping the
+// column when possible. Rows are contiguous index ranges sharing one py.
+static int moveRow(const int *px, const int *py, int count, int sel, int dir) {
+	int cy = py[sel], col = px[sel] / THUMB_W;
+	if(dir < 0) {
+		int i = sel;
+		while(i > 0 && py[i] == cy)
+			i--;
+		if(py[i] == cy)
+			return sel;
+		int ry = py[i], start = i;
+		while(start > 0 && py[start - 1] == ry)
+			start--;
+		int len = i - start;
+		return start + (col < len ? col : len);
+	}
+	int i = sel;
+	while(i < count - 1 && py[i] == cy)
+		i++;
+	if(py[i] == cy)
+		return sel;
+	int ry = py[i], end = i;
+	while(end < count - 1 && py[end + 1] == ry)
+		end++;
+	int len = end - i;
+	return i + (col < len ? col : len);
+}
+
+// Full-screen view of one photo. Returns with *idx possibly changed.
+static void fullView(u16 *gfx, const Photo *ph, int count, int *idx) {
+	u16 *yuv   = (u16 *)malloc(RAW_SIZE);
+	bool dirty = true;
+
+	while(!pmShouldReset()) {
+		if(dirty) {
+			char path[40];
+			rawPath(path, ph[*idx].num);
+			FILE *f = fopen(path, "rb");
+			if(f) {
+				fread(yuv, 1, RAW_SIZE, f);
+				fclose(f);
+				blitYuv(yuv, gfx);
+			}
+			char when[40];
+			struct tm *lt = localtime(&ph[*idx].ts);
+			if(lt)
+				strftime(when, sizeof(when), "%b %d, %Y %H:%M", lt);
+			else
+				strcpy(when, "unknown date");
+			consoleClear();
+			printf("\n  IMG_%04d  (%d/%d)\n  %s\n\n  <>: browse    B: album\n  A: send to DSi album\n",
+				   ph[*idx].num,
+				   *idx + 1,
+				   count,
+				   when);
+			dirty = false;
+		}
+
+		swiWaitForVBlank();
+		scanKeys();
+		u16 pressed = keysDown();
+
+		if(pressed & KEY_LEFT) {
+			*idx  = (*idx + count - 1) % count;
+			dirty = true;
+		} else if(pressed & KEY_RIGHT) {
+			*idx  = (*idx + 1) % count;
+			dirty = true;
+		} else if(pressed & KEY_A) {
+			printf("\n  Exporting (takes a bit)...\n");
+			printf(exportToAlbum(ph[*idx].num) ? "  Done!\n" : "  Export failed!\n");
+		} else if(pressed & (KEY_B | KEY_SELECT | KEY_START)) {
+			break;
+		}
+	}
+
+	free(yuv);
+}
+
+// The album: a grid of thumbnails. D-pad: move, L/R: page, A: full view,
+// B/SELECT: back to the camera.
+static void viewer(u16 *gfx) {
+	Photo *ph;
+	int count = scanRaw(&ph);
+	if(count == 0) {
+		printf("No photos yet.\n");
+		free(ph);
+		return;
+	}
+
+	int *px = (int *)malloc(count * sizeof(int));
+	int *py = (int *)malloc(count * sizeof(int));
+	Section *sec;
+	int nsec;
+	int virtH     = buildLayout(ph, count, px, py, &sec, &nsec);
+	int maxScroll = virtH - SCREEN_H;
+	if(maxScroll < 0)
+		maxScroll = 0;
+
+	// Cache every thumbnail in RAM (~6KB each) so scrolling never hits the SD.
+	u16 *thumbs = (u16 *)malloc(count * THUMB_W * THUMB_H * sizeof(u16));
+	consoleClear();
+	printf("\n  Loading album...\n");
+	for(int i = 0; i < count; i++)
+		getThumb(ph[i].num, thumbs + i * THUMB_W * THUMB_H);
+
+	int sel    = count - 1; // start on the newest photo
+	int scroll = maxScroll, target = maxScroll;
+	bool dirty = true, infoDirty = true;
+
+	keysSetRepeat(14, 4); // hold d-pad to keep moving
+
+	while(!pmShouldReset()) {
+		swiWaitForVBlank();
+		scanKeys();
+		u16 pressed = keysDownRepeat();
+
+		int prevSel = sel;
+		if(pressed & KEY_LEFT)
+			sel--;
+		else if(pressed & KEY_RIGHT)
+			sel++;
+		else if(pressed & KEY_UP)
+			sel = moveRow(px, py, count, sel, -1);
+		else if(pressed & KEY_DOWN)
+			sel = moveRow(px, py, count, sel, 1);
+		else if(pressed & (KEY_L | KEY_R)) {
+			// Jump to the previous/next day.
+			int s = 0;
+			while(s + 1 < nsec && sec[s + 1].start <= sel)
+				s++;
+			s += (pressed & KEY_L) ? -1 : 1;
+			if(s < 0)
+				s = 0;
+			if(s >= nsec)
+				s = nsec - 1;
+			sel = sec[s].start;
+		}
+		if(sel < 0)
+			sel = 0;
+		if(sel >= count)
+			sel = count - 1;
+		if(sel != prevSel)
+			infoDirty = true;
+
+		u16 tapped = keysDown();
+		if(tapped & KEY_A) {
+			fullView(gfx, ph, count, &sel);
+			dirty     = true;
+			infoDirty = true;
+		} else if(tapped & (KEY_B | KEY_SELECT)) {
+			break;
+		}
+
+		// Keep the selection (and its day header) on screen; ease toward it.
+		if(py[sel] - HEADER_H < target)
+			target = py[sel] - HEADER_H;
+		if(py[sel] + THUMB_H + 4 - SCREEN_H > target)
+			target = py[sel] + THUMB_H + 4 - SCREEN_H;
+		if(target < 0)
+			target = 0;
+		if(target > maxScroll)
+			target = maxScroll;
+
+		if(scroll != target) {
+			int d = target - scroll;
+			scroll += d / 3 + (d > 0 ? 1 : -1);
+			dirty = true;
+		}
+
+		if(dirty || sel != prevSel) {
+			composeAlbum(gfx, count, thumbs, sec, nsec, px, py, scroll, sel);
+			dirty = scroll != target;
+		}
+
+		if(infoDirty) {
+			consoleClear();
+			printf("\n  IMG_%04d  (%d/%d)\n", ph[sel].num, sel + 1, count);
+			printf("\n  +: select     L/R: day\n  A: view       B: camera\n");
+			infoDirty = false;
+		}
+	}
+
+	free(thumbs);
+	free(sec);
+	free(py);
+	free(px);
+	free(ph);
+	consoleClear();
+	printf("dsi-camera " VER_NUMBER "\n\nA: swap camera\nHold L/R: take photos\nSELECT: album\nSTART or POWER: exit\n");
 }
 
 int main(int argc, char **argv) {
@@ -174,13 +692,19 @@ int main(int argc, char **argv) {
 	vramSetBankA(VRAM_A_MAIN_BG);
 	videoSetMode(MODE_5_2D);
 	int bg3Main = bgInit(3, BgType_Bmp16, BgSize_B16_256x256, 1, 0);
+	u16 *gfx    = bgGetGfxPtr(bg3Main);
 
 	printf("dsi-camera " VER_NUMBER "\n");
 
 	bool fatInited = fatInitDefault();
 	if(fatInited) {
-		mkdir("/DCIM", 0777);
-		mkdir("/DCIM/100DSI00", 0777);
+		mkdir(RAW_DIR, 0777);
+		Photo *ph;
+		int count = scanRaw(&ph);
+		for(int i = 0; i < count; i++)
+			if(ph[i].num >= s_nextRawNum)
+				s_nextRawNum = ph[i].num + 1;
+		free(ph);
 	} else {
 		printf("FAT init failed, photos cannot\nbe saved.\n");
 	}
@@ -189,27 +713,52 @@ int main(int argc, char **argv) {
 	pxiWaitRemote(PXI_CAMERA); // Wait for ARM7 to initialize PXI
 	cameraInit();
 
+	// Fetch the 16-byte camera signing key from the ARM7 (it read it from the
+	// BIOS-populated WRAM at boot), as 8 halfwords because PXI immediates are
+	// only 26-bit (full words would be truncated).
+	u16 *kh = (u16 *)s_camKey;
+	for(int i = 0; i < 8; i++)
+		kh[i] = pxiSendAndReceive(PXI_CAMERA, CAM_GET_KEY0 + i);
+
+	// Background SD-writer thread, lower priority than the main thread so the
+	// preview and capture stay responsive.
+	mailboxPrepare(&s_jobMailbox, s_jobSlots, JOB_QUEUE_LEN);
+	threadPrepare(&s_workerThread, workerMain, NULL, s_workerStack + sizeof(s_workerStack), MAIN_THREAD_PRIO + 4);
+	threadStart(&s_workerThread);
+
 	Camera camera = CAM_OUTER;
 	cameraActivate(camera);
 
 	if(fatInited)
-		printf("\nA: swap camera\nHold L/R: take photos\nSTART or POWER: exit\n");
+		printf("\nA: swap camera\nHold L/R: take photos\nSELECT: album\nSTART or POWER: exit\n");
 	else
 		printf("\nA: swap camera\nSTART or POWER: exit\n");
 
 	while(1) {
-		u16 pressed;
+		u16 pressed = 0;
 		do {
 			swiWaitForVBlank();
 			// A tap of the power button asks the app to exit; leaving returns
 			// to the main menu (Unlaunch).
 			if(pmShouldReset()) {
 				cameraDeactivate(camera);
+				drainJobs();
 				return 0;
 			}
-			if(!cameraTransferActive())
-				cameraTransferStart(bgGetGfxPtr(bg3Main), CAPTURE_MODE_PREVIEW);
 			scanKeys();
+			// Lid closed: shut the camera off and sleep until it reopens.
+			if(keysHeld() & KEY_LID) {
+				while(cameraTransferActive())
+					swiWaitForVBlank();
+				cameraTransferStop();
+				cameraDeactivate(camera);
+				drainJobs(); // don't sleep with photos half-written
+				pmEnterSleep();
+				cameraActivate(camera);
+				continue;
+			}
+			if(!cameraTransferActive())
+				cameraTransferStart(gfx, CAPTURE_MODE_PREVIEW);
 			pressed = keysDown();
 		} while(!pressed);
 
@@ -227,12 +776,21 @@ int main(int argc, char **argv) {
 		} else if(fatInited && pressed & (KEY_L | KEY_R)) {
 			// Hold L/R to keep taking photos continuously.
 			do {
-				captureAndSave(bgGetGfxPtr(bg3Main));
+				captureRaw(gfx);
 				scanKeys();
-			} while(keysHeld() & (KEY_L | KEY_R));
+				// Don't keep shooting into a closed lid (e.g. in a pocket).
+			} while((keysHeld() & (KEY_L | KEY_R)) && !(keysHeld() & KEY_LID));
+		} else if(fatInited && pressed & KEY_SELECT) {
+			// Stop the live preview and browse photos.
+			while(cameraTransferActive())
+				swiWaitForVBlank();
+			cameraTransferStop();
+			drainJobs(); // so the newest shots are in the list
+			viewer(gfx);
 		} else if(pressed & KEY_START) {
 			// Disable camera so the light turns off
 			cameraDeactivate(camera);
+			drainJobs();
 
 			return 0;
 		}

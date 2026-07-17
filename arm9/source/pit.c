@@ -7,15 +7,23 @@
 
 // The DSi Camera app's photo index, same path on every region.
 #ifndef PIT_PATH
-#define PIT_PATH "/private/ds/app/484E494A/pit.bin"
+	#define PIT_PATH "/private/ds/app/484E494A/pit.bin"
 #endif
 #define PIT_ENTRY_START 0x18
 #define PIT_ENTRY_SIZE 0x10
 
 static u16 rd16(const u8 *p) { return p[0] | (p[1] << 8); }
 static u32 rd32(const u8 *p) { return p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24); }
-static void wr16(u8 *p, u16 v) { p[0] = v; p[1] = v >> 8; }
-static void wr32(u8 *p, u32 v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
+static void wr16(u8 *p, u16 v) {
+	p[0] = v;
+	p[1] = v >> 8;
+}
+static void wr32(u8 *p, u32 v) {
+	p[0] = v;
+	p[1] = v >> 8;
+	p[2] = v >> 16;
+	p[3] = v >> 24;
+}
 
 // CRC16 with polynomial 0xA001, initial value 0 (same as the DS BIOS swiCRC16).
 static u16 pitCrc(const u8 *data, long len) {
@@ -28,7 +36,7 @@ static u16 pitCrc(const u8 *data, long len) {
 	return c;
 }
 
-int pitAddPhoto(u32 dsiTimestamp) {
+int pitAddPhoto(u32 dsiTimestamp, int *outFolder) {
 	FILE *f = fopen(PIT_PATH, "rb");
 	if(!f)
 		return -1;
@@ -54,11 +62,15 @@ int pitAddPhoto(u32 dsiTimestamp) {
 
 	u16 folderM100 = rd16(d + 0x0C);
 	u16 nextFileM1 = rd16(d + 0x0E);
-	int num = nextFileM1 + 1; // file number to assign to this photo
+	int num        = nextFileM1 + 1; // file number to assign to this photo
 
-	// The file-number field is 7 bits (folder holds up to 100 files); folder
-	// rollover isn't handled, so refuse rather than corrupt neighbouring bits.
-	if(num - 1 > 99) {
+	// A folder holds 100 files; past that, roll over to the next folder
+	// (DCIM/<100+folder>NIN02) like the stock camera does.
+	if(num > 100) {
+		folderM100++;
+		num = 1;
+	}
+	if(folderM100 > 0x3FF) { // folder field is 10 bits
 		free(d);
 		return -1;
 	}
@@ -83,6 +95,7 @@ int pitAddPhoto(u32 dsiTimestamp) {
 	wr32(d + slot + 0x8, 0);
 	wr32(d + slot + 0xC, flags);
 
+	wr16(d + 0x0C, folderM100);
 	wr16(d + 0x0E, (u16)num); // next photo file number minus 1
 
 	// Recompute CRC16 over the whole file with the CRC field zeroed.
@@ -98,5 +111,7 @@ int pitAddPhoto(u32 dsiTimestamp) {
 	fwrite(d, 1, len, f);
 	fclose(f);
 	free(d);
+	if(outFolder)
+		*outFolder = 100 + folderM100;
 	return num;
 }
