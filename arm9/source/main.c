@@ -432,6 +432,10 @@ static void playVideo(u16 *gfx, int num) {
 		if(audioMore)
 			fedChunks++;
 	}
+	// Debug: hold Y while starting playback to loop the prebuffered first
+	// second of file audio without ever feeding more (isolates the feed loop).
+	if(keysHeld() & KEY_Y)
+		audioMore = false;
 	armDCacheFlush(s_playRing, sizeof(s_playRing));
 
 	// Show the first frame immediately; stage the next one.

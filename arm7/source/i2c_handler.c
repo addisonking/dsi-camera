@@ -36,6 +36,19 @@ static void micNdmaIsr(void) {
 		micexStart(); // recover from overrun
 }
 
+// A borked FIFO stalls the NDMA transfer, so the completion ISR above never
+// runs and can't do its recovery — the whole pipeline wedges after one buffer.
+// This watchdog runs off the system tick (independent of NDMA) and restarts
+// the FIFO whenever it's found dead.
+static TickTask s_micWatchdog;
+
+static void micWatchdogTick(TickTask *t) {
+	if(!s_micActive)
+		return;
+	if(REG_MICEX_CNT & MICEX_CNT_FIFO_BORKED)
+		micexStart();
+}
+
 static void micStart(void) {
 	s_micDone   = (vu32 *)s_micAddr;
 	*s_micDone  = 0;
@@ -53,10 +66,12 @@ static void micStart(void) {
 	REG_NDMAxCNT(0) = NDMA_DST_MODE(NdmaMode_Increment) | NDMA_SRC_MODE(NdmaMode_Fixed) | NDMA_BLK_WORDS(8) |
 		NDMA_TIMING(NdmaTiming_MicData) | NDMA_TX_MODE(NdmaTxMode_Timing) | NDMA_IRQ_ENABLE | NDMA_START;
 	micexStart();
+	tickTaskStart(&s_micWatchdog, micWatchdogTick, ticksFromHz(20), ticksFromHz(20));
 }
 
 static void micStop(void) {
 	s_micActive = false;
+	tickTaskStop(&s_micWatchdog);
 	REG_IE &= ~IRQ_NDMA0;
 	REG_MICEX_CNT   = 0;
 	REG_NDMAxCNT(0) = 0;
