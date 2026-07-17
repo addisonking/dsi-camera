@@ -43,42 +43,46 @@ static void micArmChannel(int ch, int slot) {
 	REG_NDMAxCNT(ch)  = MIC_NDMA_CFG;
 }
 
-// Channels 0 and 1 ping-pong: while one drains the FIFO the other is already
-// armed behind it, so a completion hands over in hardware with no IRQ-latency
-// window (the old single-channel design overran the FIFO permanently whenever
-// SD writes delayed the re-arm ISR by more than ~1ms).
-static void micProcessCompletions(void) {
-	for(int ch = 0; ch < 2; ch++) {
-		if(REG_NDMAxCNT(ch) & NDMA_START)
-			continue; // still armed/busy
-		(*s_micDone)++;
-		micArmChannel(ch, s_micSlot);
-		s_micSlot = (s_micSlot + 1) % MIC_RING_BUFS;
-	}
+// Single NDMA channel. Two armed channels sound tempting (hardware handover)
+// but the DSi round-robins DRQ bursts between all armed channels, splitting
+// the sample stream across both buffers. The channel also only starts
+// draining when armed BEFORE the FIFO comes up (the micStart order), so every
+// completion/wedge does a full pipeline restart in that exact order: FIFO
+// off, re-arm, FIFO on. Costs a few lost samples per event; a late IRQ costs
+// a short gap (watchdog recovers within 50ms) instead of killing the mic.
+static void micRecover(void) {
+	if(REG_NDMAxCNT(0) & NDMA_START)
+		return; // still capturing, nothing to do
+	REG_MICEX_CNT = 0;
+	(*s_micDone)++;
+	micArmChannel(0, s_micSlot);
+	s_micSlot = (s_micSlot + 1) % MIC_RING_BUFS;
+	micexStart();
 }
 
 static void micNdmaIsr(void) {
 	if(!s_micActive)
 		return;
-	micProcessCompletions();
-	if(REG_MICEX_CNT & MICEX_CNT_FIFO_BORKED)
-		micexStart(); // recover from overrun
+	((vu32 *)s_micAddr)[4]++; // ISR invocation count (debug)
+	micRecover();
 }
 
-// Belt and braces: tick-driven watchdog recovers even if both channels wedge.
+// Belt and braces: tick-driven watchdog recovers even if the IRQs get eaten.
 static TickTask s_micWatchdog;
 
 static void micWatchdogTick(TickTask *t) {
 	if(!s_micActive)
 		return;
-	// Debug telemetry for the ARM9: heartbeat + raw MICEX/NDMA state in the
-	// unused part of the ring header.
+	// Debug telemetry for the ARM9 in the unused part of the ring header.
 	vu32 *hdr = (vu32 *)s_micAddr;
 	hdr[1]++;
 	hdr[2] = REG_MICEX_CNT;
-	hdr[3] = REG_NDMAxCNT(0);
-	if(REG_MICEX_CNT & MICEX_CNT_FIFO_BORKED) {
-		micProcessCompletions();
+	hdr[3] = REG_NDMAxCNT(0) >> 31;
+	if(!(REG_NDMAxCNT(0) & NDMA_START)) {
+		hdr[5]++; // watchdog recovery count (debug)
+		micRecover();
+	} else if(REG_MICEX_CNT & MICEX_CNT_FIFO_BORKED) {
+		hdr[5]++;
 		micexStart();
 	}
 }
@@ -86,14 +90,15 @@ static void micWatchdogTick(TickTask *t) {
 static void micStart(void) {
 	s_micDone   = (vu32 *)s_micAddr;
 	*s_micDone  = 0;
+	for(int i = 1; i < 6; i++)
+		((vu32 *)s_micAddr)[i] = 0; // reset debug telemetry
 	s_micActive = true;
 
 	REG_MICEX_CNT = 0;
 	micArmChannel(0, 0);
-	micArmChannel(1, 1);
-	s_micSlot = 2; // next slot to arm on completion
-	irqSet(IRQ_NDMA0 | IRQ_NDMA1, micNdmaIsr);
-	irqEnable(IRQ_NDMA0 | IRQ_NDMA1);
+	s_micSlot = 1; // next slot to arm on completion
+	irqSet(IRQ_NDMA0, micNdmaIsr);
+	irqEnable(IRQ_NDMA0);
 	micexStart();
 	tickTaskStart(&s_micWatchdog, micWatchdogTick, ticksFromHz(20), ticksFromHz(20));
 }
@@ -101,10 +106,9 @@ static void micStart(void) {
 static void micStop(void) {
 	s_micActive = false;
 	tickTaskStop(&s_micWatchdog);
-	REG_IE &= ~(IRQ_NDMA0 | IRQ_NDMA1);
+	REG_IE &= ~IRQ_NDMA0;
 	REG_MICEX_CNT   = 0;
 	REG_NDMAxCNT(0) = 0;
-	REG_NDMAxCNT(1) = 0;
 }
 
 //---------------------------------------------------------------------------------
