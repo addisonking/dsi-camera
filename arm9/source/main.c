@@ -965,19 +965,16 @@ void uiSpace(void) {
 }
 
 static void uiCameraScreen(int cam, bool fatInited) {
-	uiHeader("DSI CAMERA");
-	uiTextCenter(44, cam == CAM_INNER ? "INNER CAMERA" : "OUTER CAMERA", UI_DIM);
+	uiHeader("CAMERA");
+	char sub[36];
+	sprintf(sub, "%s CAMERA - %s", cam == CAM_INNER ? "INNER" : "OUTER", s_videoMode ? "VIDEO" : "PHOTO");
+	uiTextCenter(44, sub, UI_DIM);
 	uiSpace();
 
-	int y = 82;
+	int y = 84;
 	if(fatInited) {
-		if(s_videoMode) {
-			uiKey(y, "L/R", "RECORD VIDEO");
-			uiKey(y += 16, "Y", "PHOTO MODE");
-		} else {
-			uiKey(y, "L/R", "TAKE PHOTOS");
-			uiKey(y += 16, "Y", "VIDEO MODE");
-		}
+		uiKey(y, "L/R", s_videoMode ? "RECORD" : "TAKE PHOTOS");
+		uiKey(y += 16, "Y", s_videoMode ? "PHOTO MODE" : "VIDEO MODE");
 		uiKey(y += 16, "A", "SWAP CAMERA");
 		uiKey(y += 16, "SELECT", "ALBUM");
 	} else {
@@ -1425,7 +1422,7 @@ int main(int argc, char **argv) {
 	u16 *gfx    = bgGetGfxPtr(bg3Main);
 	s_subGfx    = bgGetGfxPtr(bg3Sub);
 
-	uiHeader("DSI CAMERA");
+	uiHeader("CAMERA");
 	uiStatus("BOOTING...");
 
 	bool fatInited = fatInitDefault();
