@@ -376,9 +376,9 @@ static bool vidReadChunk(FILE *f, u32 wantType, u32 *outIdx, void *buf, u32 bufS
 		u32 hdr[3];
 		if(fread(hdr, sizeof(hdr), 1, f) != 1)
 			return false;
-		if(hdr[2] > bufSz)
-			return false;
 		if(hdr[0] == wantType) {
+			if(hdr[2] > bufSz) // corrupt chunk of the type we want
+				return false;
 			*outIdx = hdr[1];
 			return fread(buf, hdr[2], 1, f) == 1;
 		}

@@ -28,8 +28,10 @@ import struct, subprocess, sys, os, tempfile
 
 src, dst = sys.argv[1], sys.argv[2]
 d = open(src, 'rb').read()
-magic, w, h, fps, den, rate, fmt, frames_total, samp_total = struct.unpack('<8s8I', d[:40])
-assert magic == b'DSIVID01', 'not a dsi-camera video'
+if len(d) < 40 or d[:8] != b'DSIVID01':
+    print(f'{src}: empty or not a dsi-camera video, skipping')
+    sys.exit(0)
+w, h, fps, den, rate, fmt, frames_total, samp_total = struct.unpack('<8I', d[8:40])
 
 # Walk chunks; duplicate the previous frame over index gaps (dropped frames).
 off, frames, pcm, lv = 40, [], b'', -1
