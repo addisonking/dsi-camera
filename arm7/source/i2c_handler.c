@@ -189,7 +189,7 @@ int i2cPxiThreadMain(void *arg) {
 			case CAM_LED_OFF:
 			case CAM_LED_ON:
 			case CAM_LED_BLINK:
-				// Power LED: steady blue normally, blinking as shutter/REC cue.
+				// Power LED: steady blue normally, red as shutter/REC cue.
 				i2cLock();
 				i2cWriteRegister8(I2cDev_MCU, McuReg_PowerLed, msg == CAM_LED_OFF ? 0 : 1);
 				i2cUnlock();
