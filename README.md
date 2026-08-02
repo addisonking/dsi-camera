@@ -7,6 +7,7 @@ A homebrew camera app for the Nintendo DSi. Fork of [Pk11's dsi-camera](https://
 - Photos: raw 640x480 YUV from either camera, burst capture while held
 - Video: 256x192 @ 10fps with microphone audio, recorded to a simple chunked container
 - Album: date-grouped thumbnail gallery with full-screen viewing, video playback with sound, and delete
+- Optional timestamp watermark burned into photos and video frames as they're captured
 - Export photos to the stock DSi Camera album (signed, shows up like a real photo)
 - Power LED turns red while capturing
 - `tools/convert.sh` converts photos to PNG and videos to MP4 on a PC (ffmpeg + python3)
@@ -18,6 +19,7 @@ A homebrew camera app for the Nintendo DSi. Fork of [Pk11's dsi-camera](https://
 | L/R | Take photos / start & stop recording |
 | Y | Toggle photo / video mode |
 | A | Swap camera |
+| X | Toggle timestamp watermark |
 | SELECT | Album |
 | START | Exit |
 
@@ -31,7 +33,14 @@ make
 
 Copy `dsi-camera.nds` to your SD card and launch it (tested with Unlaunch).
 Photos and videos are saved to `sd:/photos/`; drop `tools/convert.sh` in that
-folder and run it on a PC to get PNGs and MP4s.
+folder and run it on a PC to get PNGs and MP4s. Options (currently just the
+timestamp watermark) persist in `sd:/photos/settings.cfg`.
+
+The watermark is off by default. When on, the capture date and time are drawn
+into the pixels themselves — bottom right, white with a black outline — so they
+survive export to the DSi album and conversion on a PC. It's applied at capture
+time only; existing photos are never modified, and the live viewfinder stays
+clean.
 
 ## Credits
 
