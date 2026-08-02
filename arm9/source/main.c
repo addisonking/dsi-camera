@@ -39,8 +39,11 @@ int clamp(int val, int min, int max) { return val < min ? min : (val > max ? max
 static u16 *s_subGfx;    // bottom-screen bitmap, drawn by the ui* helpers
 static Camera s_camera;  // currently active camera
 static bool s_videoMode; // camera screen: photo vs video mode
+static bool s_timestamp; // burn the capture time into saved pixels
 static void uiStatus(const char *s);
 void uiSpace(void);
+static void watermarkYuv(u16 *yuv, time_t t);
+static void watermarkFrame(u16 *gfx, time_t t);
 
 // Lid closed: shut the camera off and sleep until it reopens. Usable from any
 // screen; VRAM survives sleep so nothing needs redrawing after.
@@ -118,6 +121,29 @@ static void rawPath(char *out, int num) { sprintf(out, RAW_DIR "/IMG_%04d.YUV", 
 static void thumbPath(char *out, int num) { sprintf(out, RAW_DIR "/IMG_%04d.THM", num); }
 static void vidPath(char *out, int num) { sprintf(out, RAW_DIR "/VID_%04d.VID", num); }
 static void vidThumbPath(char *out, int num) { sprintf(out, RAW_DIR "/VID_%04d.THM", num); }
+
+// --- Settings: a small key=value file beside the photos so toggles survive a
+// --- reboot. Read once at boot, rewritten whenever an option changes.
+#define CFG_PATH RAW_DIR "/settings.cfg"
+
+static void cfgLoad(void) {
+	FILE *f = fopen(CFG_PATH, "r");
+	if(!f)
+		return;
+	char line[64];
+	while(fgets(line, sizeof(line), f))
+		if(strncmp(line, "timestamp=", 10) == 0)
+			s_timestamp = atoi(line + 10) != 0;
+	fclose(f);
+}
+
+static void cfgSave(void) {
+	FILE *f = fopen(CFG_PATH, "w");
+	if(!f)
+		return;
+	fprintf(f, "timestamp=%d\n", s_timestamp ? 1 : 0);
+	fclose(f);
+}
 
 // Album grid layout: 4x3 cells of 64x48 thumbnails (raw RGB555, cached as
 // .THM files beside the raws so the grid doesn't have to read 600KB per cell).
@@ -362,6 +388,11 @@ static void captureRaw(u16 *previewGfx) {
 	// green speckles); paper over it with the second line.
 	memcpy(yuv, yuv + 640, 640 * sizeof(u16));
 
+	// Stamped before the preview blit and the thumbnail, so what's shown
+	// matches what lands on the card.
+	if(s_timestamp)
+		watermarkYuv(yuv, time(NULL));
+
 	if(previewGfx)
 		blitYuv(yuv, previewGfx);
 
@@ -597,11 +628,12 @@ static void recordVideo(u16 *gfx, int num) {
 	pxiSendAndReceive(PXI_CAMERA, CAM_LED_BLINK); // recording indicator
 
 	// Paced by vblank count (~59.8Hz): keep a frame every keepEvery vblanks.
-	u32 vbl       = 0;
-	u32 keepEvery = 60 / VID_FPS;
-	u32 lastKeep  = 0;
-	int lastSec   = -1;
-	bool stop     = false;
+	u32 vbl        = 0;
+	u32 keepEvery  = 60 / VID_FPS;
+	u32 lastKeep   = 0;
+	int lastSec    = -1;
+	bool stop      = false;
+	time_t recTime = time(NULL); // watermark clock: start + elapsed seconds
 
 	while(!stop) {
 		swiWaitForVBlank();
@@ -622,6 +654,10 @@ static void recordVideo(u16 *gfx, int num) {
 				} else {
 					int slot = s_vidFree[s_vidFreeTail++ % VID_SLOTS];
 					memcpy(s_vidRing[slot], gfx, VID_FRAME_SIZE);
+					// Stamped on the ring copy, never on gfx: the viewfinder
+					// stays clean and the camera DMA can't race the text.
+					if(s_timestamp)
+						watermarkFrame(s_vidRing[slot], recTime + vbl / 60);
 					Job *job  = &s_vidJobs[slot];
 					job->type = CHUNK_VIDEO;
 					job->aux  = frameIdx++;
@@ -912,6 +948,69 @@ static void drawText(u16 *gfx, int x, int y, const char *s, u16 col) {
 	}
 }
 
+// --- Timestamp watermark: when enabled, the capture time is burned into the
+// --- saved pixels (photos and video frames) with the same 5x7 font, so it
+// --- survives export and conversion. Never drawn into the live preview.
+
+#define WM_SCALE 3 // font blown up to 15x21 for the 640x480 raws
+
+// "YYYY-MM-DD HH:MM:SS", or empty if the clock can't be read.
+static void wmFormat(char *out, size_t sz, time_t t) {
+	struct tm *lt = localtime(&t);
+	if(!lt || strftime(out, sz, "%Y-%m-%d %H:%M:%S", lt) == 0)
+		out[0] = '\0';
+}
+
+static void yuvSetPixel(u16 *yuv, int x, int y, u8 luma) {
+	if(x < 0 || x >= 640 || y < 0 || y >= 480)
+		return;
+	u8 *px = (u8 *)(yuv + y * 640 + x);
+	px[0]  = luma;
+	px[1]  = 0x80; // neutral chroma so the text stays grey
+}
+
+static void yuvDrawText(u16 *yuv, int x, int y, const char *s, u8 luma) {
+	for(; *s; s++, x += 6 * WM_SCALE) {
+		const u8 *g = glyph(*s);
+		for(int cx = 0; cx < 5; cx++) {
+			for(int cy = 0; cy < 7; cy++) {
+				if(!(g[cx] >> cy & 1))
+					continue;
+				for(int sy = 0; sy < WM_SCALE; sy++)
+					for(int sx = 0; sx < WM_SCALE; sx++)
+						yuvSetPixel(yuv, x + cx * WM_SCALE + sx, y + cy * WM_SCALE + sy, luma);
+			}
+		}
+	}
+}
+
+// Bottom-right of a 640x480 YUV422 frame, outlined in black (one stroke width
+// in each direction) so it stays readable over a bright scene.
+static void watermarkYuv(u16 *yuv, time_t t) {
+	char s[24];
+	wmFormat(s, sizeof(s), t);
+	if(!s[0])
+		return;
+	int w = (int)strlen(s) * 6 * WM_SCALE - WM_SCALE; // minus the trailing gap
+	int x = 640 - w - 14, y = 480 - 7 * WM_SCALE - 14;
+	for(int dy = -1; dy <= 1; dy++)
+		for(int dx = -1; dx <= 1; dx++)
+			if(dx || dy)
+				yuvDrawText(yuv, x + dx * WM_SCALE, y + dy * WM_SCALE, s, 0x10);
+	yuvDrawText(yuv, x, y, s, 0xEB);
+}
+
+// The same stamp at 1x for a 256x192 RGB555 video frame.
+static void watermarkFrame(u16 *gfx, time_t t) {
+	char s[24];
+	wmFormat(s, sizeof(s), t);
+	if(!s[0])
+		return;
+	int x = 256 - (int)strlen(s) * 6 - 3, y = SCREEN_H - 11;
+	drawText(gfx, x + 1, y + 1, s, BIT(15)); // drop shadow
+	drawText(gfx, x, y, s, BIT(15) | RGB15(31, 31, 31));
+}
+
 // --- Bottom-screen UI: minimalist monochrome panels drawn with the pixel
 // --- font instead of a scrolling console.
 
@@ -994,6 +1093,7 @@ static void uiCameraScreen(int cam, bool fatInited) {
 		uiKey(y += 16, "Y", s_videoMode ? "PHOTO MODE" : "VIDEO MODE");
 		uiKey(y += 16, "A", "SWAP CAMERA");
 		uiKey(y += 16, "SELECT", "ALBUM");
+		uiKey(y += 16, "X", s_timestamp ? "TIMESTAMP: ON" : "TIMESTAMP: OFF");
 	} else {
 		uiTextCenter(y, "NO SD CARD - CANT SAVE", UI_FG);
 		uiKey(y += 16, "A", "SWAP CAMERA");
@@ -1453,6 +1553,7 @@ int main(int argc, char **argv) {
 	bool fatInited = fatInitDefault();
 	if(fatInited) {
 		mkdir(RAW_DIR, 0777);
+		cfgLoad();
 		Photo *ph;
 		int count = scanRaw(&ph);
 		for(int i = 0; i < count; i++)
@@ -1564,6 +1665,11 @@ int main(int argc, char **argv) {
 		} else if(fatInited && pressed & KEY_Y) {
 			s_videoMode = !s_videoMode;
 			uiCameraScreen(camera, fatInited);
+		} else if(fatInited && pressed & KEY_X) {
+			s_timestamp = !s_timestamp;
+			cfgSave();
+			uiCameraScreen(camera, fatInited);
+			uiStatus(s_timestamp ? "TIMESTAMP ON" : "TIMESTAMP OFF");
 		} else if(fatInited && pressed & (KEY_L | KEY_R)) {
 			if(s_videoMode) {
 				// Tap L/R to record, tap again to stop.
