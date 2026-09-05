@@ -7,6 +7,10 @@ extern "C" {
 
 #define PXI_CAMERA PxiChannel_User0
 
+// Sent on PxiChannel_User1 when the ARM7 wakes from sleep because both
+// shoulder buttons were pressed.
+#define PXI_SLEEP_SHOULDER_WAKE 0x5348
+
 typedef enum {
 	CAM_INIT,
 	CAM0_ACTIVATE,

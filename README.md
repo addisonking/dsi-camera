@@ -16,6 +16,7 @@ A homebrew camera app for the Nintendo DSi. Fork of [Pk11's dsi-camera](https://
 | Key | Action |
 | --- | --- |
 | L/R | Take photos / start & stop recording |
+| L+R with lid closed | Take a back-camera photo |
 | Y | Toggle photo / video mode |
 | A | Swap camera |
 | SELECT | Album |

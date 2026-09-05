@@ -39,14 +39,28 @@ int clamp(int val, int min, int max) { return val < min ? min : (val > max ? max
 static u16 *s_subGfx;    // bottom-screen bitmap, drawn by the ui* helpers
 static Camera s_camera;  // currently active camera
 static bool s_videoMode; // camera screen: photo vs video mode
+static volatile bool s_sleepShoulderWake;
 static void uiStatus(const char *s);
 void uiSpace(void);
+
+static void sleepWakeHandler(void *user, u32 msg) {
+	(void)user;
+	if(msg == PXI_SLEEP_SHOULDER_WAKE)
+		s_sleepShoulderWake = true;
+}
+
+static bool consumeSleepShoulderWake(void) {
+	bool wake           = s_sleepShoulderWake;
+	s_sleepShoulderWake = false;
+	return wake;
+}
 
 // Lid closed: shut the camera off and sleep until it reopens. Usable from any
 // screen; VRAM survives sleep so nothing needs redrawing after.
 static void lidSleep(void) {
 	cameraDeactivate(s_camera);
 	pmEnterSleep();
+	consumeSleepShoulderWake();
 	cameraActivate(s_camera);
 }
 
@@ -1496,6 +1510,7 @@ int main(int argc, char **argv) {
 
 	uiStatus("INITIALIZING...");
 	pxiWaitRemote(PXI_CAMERA); // Wait for ARM7 to initialize PXI
+	pxiSetHandler(PxiChannel_User1, sleepWakeHandler, NULL);
 	cameraInit();
 	soundInit(); // ARM9 interface to the ARM7 sound driver (video playback)
 	soundPowerOn();
@@ -1533,7 +1548,8 @@ int main(int argc, char **argv) {
 				return 0;
 			}
 			scanKeys();
-			// Lid closed: shut the camera off and sleep until it reopens.
+			// Lid closed: shut the camera off and sleep until it reopens. A paired
+			// L/R press wakes the ARM7 without opening the lid.
 			if(keysHeld() & KEY_LID) {
 				while(cameraTransferActive())
 					swiWaitForVBlank();
@@ -1541,7 +1557,31 @@ int main(int argc, char **argv) {
 				cameraDeactivate(camera);
 				drainJobs(); // don't sleep with photos half-written
 				pmEnterSleep();
+
+				bool shoulderWake = consumeSleepShoulderWake();
+				scanKeys();
+				bool shouldersHeld = (keysHeld() & (KEY_L | KEY_R)) == (KEY_L | KEY_R);
 				cameraActivate(camera);
+
+				if(fatInited && (shoulderWake || shouldersHeld)) {
+					Camera sleepCamera = camera;
+					cameraActivate(CAM_OUTER);
+					s_camera = CAM_OUTER;
+					pxiSendAndReceive(PXI_CAMERA, CAM_LED_ON);
+					captureRaw(gfx);
+					pxiSendAndReceive(PXI_CAMERA, CAM_LED_OFF);
+					uiSpace();
+
+					// Wait for release so holding L+R cannot trigger another shot
+					// immediately when the app goes back to sleep.
+					do {
+						swiWaitForVBlank();
+						scanKeys();
+					} while(keysHeld() & (KEY_L | KEY_R));
+
+					cameraActivate(sleepCamera);
+					s_camera = sleepCamera;
+				}
 				continue;
 			}
 			if(!cameraTransferActive())

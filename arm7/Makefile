@@ -29,6 +29,8 @@ CFLAGS   := -g -Wall -Os -ffunction-sections -fdata-sections\
 CXXFLAGS := $(CFLAGS) -fno-rtti -fno-exceptions
 ASFLAGS  := -g $(ARCH)
 LDFLAGS   = -specs=ds_arm7.specs -g $(ARCH) -Wl,-Map,$(notdir $*).map
+# Let sleep.c override Calico's PM routine so L+R can wake the ARM7.
+LDFLAGS  += -Wl,--allow-multiple-definition
 
 LIBS := -lmm7 -lnds7
 
