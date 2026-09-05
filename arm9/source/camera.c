@@ -84,6 +84,9 @@ void cameraTransferStart(u16 *dst, CaptureMode mode) {
 	REG_NDMA1CNT  = 0x8B044000;                            // start camera DMA
 }
 
-void cameraTransferStop() { REG_CAM_CNT &= ~BIT(15); }
+void cameraTransferStop() {
+	REG_CAM_CNT &= ~BIT(15);
+	REG_NDMA1CNT = 0;
+}
 
 bool cameraTransferActive() { return REG_NDMA1CNT & BIT(31); }

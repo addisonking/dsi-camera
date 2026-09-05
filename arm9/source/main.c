@@ -345,14 +345,26 @@ static void drainJobs(void) {
 		swiWaitForVBlank();
 }
 
+#define CAMERA_TRANSFER_TIMEOUT 120 // about two seconds at 60Hz
+
+static bool waitCameraTransfer(void) {
+	for(int i = 0; i < CAMERA_TRANSFER_TIMEOUT; i++) {
+		if(!cameraTransferActive())
+			return true;
+		swiWaitForVBlank();
+	}
+	cameraTransferStop();
+	return false;
+}
+
 // Captures one full-res frame and queues it for background saving. Blocks
 // only for the capture DMA itself (or for a queue slot if the SD card is
 // >JOB_QUEUE_LEN frames behind). `previewGfx` is the top-screen bitmap; the
 // frame is drawn to it so the preview updates during a burst.
-static void captureRaw(u16 *previewGfx) {
+static bool captureRaw(u16 *previewGfx) {
 	// Wait for previous transfer to finish
-	while(cameraTransferActive())
-		swiWaitForVBlank();
+	if(!waitCameraTransfer())
+		return false;
 
 	u16 *yuv = NULL;
 	Job *job = NULL;
@@ -368,8 +380,11 @@ static void captureRaw(u16 *previewGfx) {
 	}
 
 	cameraTransferStart(yuv, CAPTURE_MODE_CAPTURE);
-	while(cameraTransferActive())
-		swiWaitForVBlank();
+	if(!waitCameraTransfer()) {
+		free(yuv);
+		free(job);
+		return false;
+	}
 	cameraTransferStop();
 
 	// The sensor's first scanline carries garbage/embedded data (shows up as
@@ -385,17 +400,19 @@ static void captureRaw(u16 *previewGfx) {
 	while(!mailboxTrySend(&s_jobMailbox, (u32)job))
 		swiWaitForVBlank(); // queue full, wait for the worker
 	s_jobsQueued++;
+	return true;
 }
 
 // Let the sensor produce a few preview frames after waking from standby. This
 // gives the back camera's pipeline and auto-exposure time to settle.
-static void cameraWarmup(u16 *previewGfx) {
+static bool cameraWarmup(u16 *previewGfx) {
 	for(int i = 0; i < 3; i++) {
 		cameraTransferStart(previewGfx, CAPTURE_MODE_PREVIEW);
-		while(cameraTransferActive())
-			swiWaitForVBlank();
+		if(!waitCameraTransfer())
+			return false;
 		cameraTransferStop();
 	}
+	return true;
 }
 
 // --- Video playback: audio streams through a looping ring while frames are
@@ -1580,9 +1597,15 @@ int main(int argc, char **argv) {
 						cameraActivate(CAM_OUTER);
 						s_camera = CAM_OUTER;
 					}
-					cameraWarmup(gfx);
+					bool ready = cameraWarmup(gfx);
+					if(!ready) {
+						cameraDeactivate(CAM_OUTER);
+						cameraActivate(CAM_OUTER);
+						ready = cameraWarmup(gfx);
+					}
 					pxiSendAndReceive(PXI_CAMERA, CAM_LED_ON);
-					captureRaw(gfx);
+					if(ready)
+						captureRaw(gfx);
 					pxiSendAndReceive(PXI_CAMERA, CAM_LED_OFF);
 					uiSpace();
 
@@ -1633,7 +1656,8 @@ int main(int argc, char **argv) {
 				// lights while shooting, like a shutter indicator.
 				pxiSendAndReceive(PXI_CAMERA, CAM_LED_ON);
 				do {
-					captureRaw(gfx);
+					if(!captureRaw(gfx))
+						break;
 					scanKeys();
 					// Don't keep shooting into a closed lid (e.g. in a pocket).
 				} while((keysHeld() & (KEY_L | KEY_R)) && !(keysHeld() & KEY_LID));
