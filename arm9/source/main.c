@@ -387,6 +387,17 @@ static void captureRaw(u16 *previewGfx) {
 	s_jobsQueued++;
 }
 
+// Let the sensor produce a few preview frames after waking from standby. This
+// gives the back camera's pipeline and auto-exposure time to settle.
+static void cameraWarmup(u16 *previewGfx) {
+	for(int i = 0; i < 3; i++) {
+		cameraTransferStart(previewGfx, CAPTURE_MODE_PREVIEW);
+		while(cameraTransferActive())
+			swiWaitForVBlank();
+		cameraTransferStop();
+	}
+}
+
 // --- Video playback: audio streams through a looping ring while frames are
 // --- blitted at their pacing-slot times. Hardware timer 0 free-runs at
 // --- BUS_CLOCK/1024 and is the single A/V clock (polled via timerElapsed, no
@@ -1565,8 +1576,11 @@ int main(int argc, char **argv) {
 
 				if(fatInited && (shoulderWake || shouldersHeld)) {
 					Camera sleepCamera = camera;
-					cameraActivate(CAM_OUTER);
-					s_camera = CAM_OUTER;
+					if(sleepCamera != CAM_OUTER) {
+						cameraActivate(CAM_OUTER);
+						s_camera = CAM_OUTER;
+					}
+					cameraWarmup(gfx);
 					pxiSendAndReceive(PXI_CAMERA, CAM_LED_ON);
 					captureRaw(gfx);
 					pxiSendAndReceive(PXI_CAMERA, CAM_LED_OFF);
@@ -1579,8 +1593,10 @@ int main(int argc, char **argv) {
 						scanKeys();
 					} while(keysHeld() & (KEY_L | KEY_R));
 
-					cameraActivate(sleepCamera);
-					s_camera = sleepCamera;
+					if(sleepCamera != CAM_OUTER) {
+						cameraActivate(sleepCamera);
+						s_camera = sleepCamera;
+					}
 				}
 				continue;
 			}
