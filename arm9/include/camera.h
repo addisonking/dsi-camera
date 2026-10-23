@@ -19,6 +19,10 @@ extern "C" {
 #define REG_NDMA1BCNT *(vu32 *)0x04004130
 #define REG_NDMA1CNT *(vu32 *)0x04004138
 
+// Preview frame (256x192 RGB555) in bytes and NDMA words.
+#define CAM_PREVIEW_SIZE (256 * 192 * 2)
+#define CAM_PREVIEW_WORDS (CAM_PREVIEW_SIZE / 4)
+
 typedef enum { CAM_NONE, CAM_INNER, CAM_OUTER } Camera;
 
 // Initializes the cameras
@@ -30,14 +34,33 @@ bool cameraActivate(Camera cam);
 // Deactivates a camera
 bool cameraDeactivate(Camera cam);
 
-// Starts transfer from the camera to the specified RAM/VRAM using NDMA 1
-void cameraTransferStart(u16 *dst, CaptureMode mode);
+// Grabs a single frame into dst (RAM or VRAM) and leaves the camera stopped.
+// The camera interface is (re)configured per call, so this is cheap only for
+// snapshots. Returns false if the transfer did not finish (camera stalled).
+bool cameraCapture(u16 *dst, CaptureMode mode);
 
-// Stops camera transfer
-void cameraTransferStop(void);
+// Continuous preview capture: the camera interface is started once and NDMA1
+// is re-armed from its completion IRQ into one of three internal frame buffers,
+// so the sensor never has to be stopped/flushed between frames. Only preview
+// mode (256x192) is supported; call cameraCapture for 640x480 shots.
+bool cameraStreamStart(void);
 
-// Checks if a camera transfer is active
-bool cameraTransferActive(void);
+// Stops continuous capture (safe to call when not streaming).
+void cameraStreamStop(void);
+
+// True while the continuous stream is armed. Single source of truth for
+// whether the viewfinder should be producing frames.
+bool cameraStreamRunning(void);
+
+// Returns the newest completed frame, or NULL if no new frame arrived since the
+// last call. The pointer is one of three buffers the camera rotates through, so
+// it stays valid for about two frame periods - copy out what you need right
+// away. Cache is invalidated for you.
+u16 *cameraNextFrame(void);
+
+// Number of camera FIFO overrun episodes (data dropped between re-arms) since
+// boot. Never reset; the recorder reports the delta for its clip.
+u32 cameraStreamOverruns(void);
 
 #ifdef __cplusplus
 }
