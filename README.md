@@ -5,7 +5,7 @@ A homebrew camera app for the Nintendo DSi. Fork of [Pk11's dsi-camera](https://
 ## Features
 
 - Photos: raw 640x480 YUV from either camera, burst capture while held
-- Video: 256x192 @ 10fps with microphone audio, recorded to a simple chunked container
+- Video: 256x192 with microphone audio at up to 10fps, recorded to a simple chunked container
 - Album: date-grouped thumbnail gallery with full-screen viewing, video playback with sound, and delete
 - Optional timestamp watermark burned into photos and video frames as they're captured
 - Export photos to the stock DSi Camera album (signed, shows up like a real photo)

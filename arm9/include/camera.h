@@ -19,6 +19,10 @@ extern "C" {
 #define REG_NDMA1BCNT *(vu32 *)0x04004130
 #define REG_NDMA1CNT *(vu32 *)0x04004138
 
+// Preview frame (256x192 RGB555) in bytes and NDMA words.
+#define CAM_PREVIEW_SIZE (256 * 192 * 2)
+#define CAM_PREVIEW_WORDS (CAM_PREVIEW_SIZE / 4)
+
 typedef enum { CAM_NONE, CAM_INNER, CAM_OUTER } Camera;
 
 // Initializes the cameras
@@ -30,14 +34,29 @@ bool cameraActivate(Camera cam);
 // Deactivates a camera
 bool cameraDeactivate(Camera cam);
 
-// Starts transfer from the camera to the specified RAM/VRAM using NDMA 1
-void cameraTransferStart(u16 *dst, CaptureMode mode);
+// Grabs a single frame into dst (RAM or VRAM) and leaves the camera stopped.
+// The camera interface is (re)configured per call, so this is cheap only for
+// snapshots. Returns false if the transfer did not finish (camera stalled).
+bool cameraCapture(u16 *dst, CaptureMode mode);
 
-// Stops camera transfer
-void cameraTransferStop(void);
+// Continuous preview capture: the camera interface is started once and NDMA1
+// is re-armed from its completion IRQ into one of two internal frame buffers,
+// so the sensor never has to be stopped/flushed between frames. Only preview
+// mode (256x192) is supported; call cameraCapture for 640x480 shots.
+bool cameraStreamStart(void);
 
-// Checks if a camera transfer is active
-bool cameraTransferActive(void);
+// Stops continuous capture (safe to call when not streaming).
+void cameraStreamStop(void);
+
+// Returns the newest completed frame, or NULL if no new frame arrived since the
+// last call. The pointer is one of two buffers that the camera alternates
+// between, so it stays valid until roughly one frame period later - copy out
+// what you need right away. Cache is invalidated for you.
+u16 *cameraNextFrame(void);
+
+// Number of camera FIFO overruns (data dropped between re-arms) since the
+// stream started; nonzero means a frame or two of the stream was lost.
+u32 cameraStreamOverruns(void);
 
 #ifdef __cplusplus
 }

@@ -36,34 +36,61 @@
 
 int clamp(int val, int min, int max) { return val < min ? min : (val > max ? max : val); }
 
-static u16 *s_subGfx;    // bottom-screen bitmap, drawn by the ui* helpers
-static Camera s_camera;  // currently active camera
-static bool s_videoMode; // camera screen: photo vs video mode
-static bool s_timestamp; // burn the capture time into saved pixels
+static u16 *s_subGfx;       // bottom-screen bitmap, drawn by the ui* helpers
+static Camera s_camera;     // currently active camera
+static bool s_videoMode;    // camera screen: photo vs video mode
+static bool s_timestamp;    // burn the capture time into saved pixels
+static bool s_streaming;    // viewfinder camera stream is running
+static char s_savedMsg[44]; // last "saved video" summary, kept after the redraw
 static void uiStatus(const char *s);
 void uiSpace(void);
 static void watermarkYuv(u16 *yuv, time_t t);
 static void watermarkFrame(u16 *gfx, time_t t);
 
+// The viewfinder is a continuous camera stream now; keep its state in one
+// place so every path that leaves the camera screen stops it.
+static void streamStart(void) {
+	if(s_streaming)
+		return;
+	cameraStreamStart();
+	s_streaming = true;
+}
+
+static void streamStop(void) {
+	if(!s_streaming)
+		return;
+	cameraStreamStop();
+	s_streaming = false;
+}
+
 // Lid closed: shut the camera off and sleep until it reopens. Usable from any
 // screen; VRAM survives sleep so nothing needs redrawing after.
 static void lidSleep(void) {
+	bool wasStreaming = s_streaming;
+	streamStop();
 	cameraDeactivate(s_camera);
 	pmEnterSleep();
 	cameraActivate(s_camera);
+	if(wasStreaming)
+		streamStart();
 }
 
 // --- Video recording: 256x192 RGB555 frames from preview mode + mic audio,
 // --- written as a custom .VID container by the worker thread.
+//
+// VID_MAGIC "DSIVID02" video chunks carry the capture time in milliseconds in
+// their chunk index field, so playback is paced by when each frame was really
+// taken. "DSIVID01" files (frame index only) still play.
 
-#define VID_FPS 10 // what a DSi SD card can actually sustain (~1MB/s)
+#define VID_FPS 10 // capture throttle; the sensor itself runs slower than this
 #define VID_W 256
 #define VID_H 192
 #define VID_FRAME_SIZE (VID_W * VID_H * 2)
 #define VID_SLOTS 24 // ~2.4MB ring; a frame is dropped if it fills
 #define AUD_CHUNKS 16
 
-#define VID_MAGIC "DSIVID01"
+#define VID_MAGIC "DSIVID02"
+#define VID_MAGIC_OLD "DSIVID01"
 #define CHUNK_VIDEO 1
 #define CHUNK_AUDIO 2
 #define MIC_RATE_HZ 16364 // MICEX rate div1
@@ -197,8 +224,8 @@ static int scanRaw(Photo **outPhotos) {
 				if(vf) {
 					u32 vh[10];
 					if(fread(vh, sizeof(vh), 1, vf) == 1 && memcmp(vh, VID_MAGIC, 8) == 0) {
-						u32 vsec = vh[4] ? vh[8] / vh[4] : 0;
-						u32 asec = vh[6] ? vh[9] / vh[6] : 0;
+						u32 vsec         = vh[4] ? vh[8] / vh[4] : 0;
+						u32 asec         = vh[6] ? vh[9] / vh[6] : 0;
 						ph[count].durSec = (u16)(vsec > asec ? vsec : asec);
 					}
 					fclose(vf);
@@ -313,9 +340,9 @@ static int workerMain(void *arg) {
 			if(f) {
 				fwrite(job->buf, 1, RAW_SIZE, f);
 				fclose(f);
-				sprintf(msg, "SAVED IMG_%04d", job->aux);
+				sprintf(msg, "SAVED IMG_%04d", (int)job->aux);
 			} else {
-				sprintf(msg, "SAVE FAILED: IMG_%04d", job->aux);
+				sprintf(msg, "SAVE FAILED: IMG_%04d", (int)job->aux);
 			}
 			uiStatus(msg);
 
@@ -361,16 +388,12 @@ static void drainJobs(void) {
 // only for the capture DMA itself (or for a queue slot if the SD card is
 // >JOB_QUEUE_LEN frames behind). `previewGfx` is the top-screen bitmap; the
 // frame is drawn to it so the preview updates during a burst.
-static void captureRaw(u16 *previewGfx) {
-	// Wait for previous transfer to finish
-	while(cameraTransferActive())
-		swiWaitForVBlank();
-
+static bool captureRaw(u16 *previewGfx) {
 	u16 *yuv = NULL;
 	Job *job = NULL;
 	for(;;) {
-		if(!yuv)
-			yuv = (u16 *)malloc(RAW_SIZE);
+		if(!yuv) // cache line aligned: the camera DMA writes around the cache
+			yuv = (u16 *)memalign(32, RAW_SIZE);
 		if(!job)
 			job = (Job *)malloc(sizeof(Job));
 		if(yuv && job)
@@ -379,10 +402,13 @@ static void captureRaw(u16 *previewGfx) {
 		swiWaitForVBlank();
 	}
 
-	cameraTransferStart(yuv, CAPTURE_MODE_CAPTURE);
-	while(cameraTransferActive())
-		swiWaitForVBlank();
-	cameraTransferStop();
+	// Bounded inside camera.c: a stalled camera fails the shot instead of
+	// hanging the app.
+	if(!cameraCapture(yuv, CAPTURE_MODE_CAPTURE)) {
+		free(yuv);
+		free(job);
+		return false;
+	}
 
 	// The sensor's first scanline carries garbage/embedded data (shows up as
 	// green speckles); paper over it with the second line.
@@ -402,6 +428,7 @@ static void captureRaw(u16 *previewGfx) {
 	while(!mailboxTrySend(&s_jobMailbox, (u32)job))
 		swiWaitForVBlank(); // queue full, wait for the worker
 	s_jobsQueued++;
+	return true;
 }
 
 // --- Video playback: audio streams through a looping ring while frames are
@@ -435,7 +462,9 @@ static bool vidReadChunk(FILE *f, u32 wantType, u32 *outIdx, void *buf, u32 bufS
 // Reads a video's first frame into gfx (which is also its display bitmap).
 static bool vidReadFirstFrame(FILE *f, u16 *gfx) {
 	u32 hdr[10];
-	if(fread(hdr, sizeof(hdr), 1, f) != 1 || memcmp(hdr, VID_MAGIC, 8) != 0)
+	if(fread(hdr, sizeof(hdr), 1, f) != 1)
+		return false;
+	if(memcmp(hdr, VID_MAGIC, 8) != 0 && memcmp(hdr, VID_MAGIC_OLD, 8) != 0)
 		return false;
 	u32 idx;
 	return vidReadChunk(f, CHUNK_VIDEO, &idx, gfx, VID_FRAME_SIZE);
@@ -450,7 +479,15 @@ static void playVideo(u16 *gfx, int num) {
 		return;
 	}
 	u32 hdr[10];
-	if(fread(hdr, sizeof(hdr), 1, fv) != 1 || memcmp(hdr, VID_MAGIC, 8) != 0) {
+	if(fread(hdr, sizeof(hdr), 1, fv) != 1) {
+		fclose(fv);
+		uiStatus("BAD VIDEO FILE");
+		return;
+	}
+	// DSIVID02 stamps each video chunk with its capture time in ms; the older
+	// DSIVID01 used a frame index paced at a fixed fps.
+	bool timed = memcmp(hdr, VID_MAGIC, 8) == 0;
+	if(!timed && memcmp(hdr, VID_MAGIC_OLD, 8) != 0) {
 		fclose(fv);
 		uiStatus("BAD VIDEO FILE");
 		return;
@@ -481,14 +518,15 @@ static void playVideo(u16 *gfx, int num) {
 	armDCacheFlush(s_playRing, sizeof(s_playRing));
 
 	// Show the first frame immediately; stage the next one.
-	u16 *stage = (u16 *)malloc(VID_FRAME_SIZE);
-	u32 vIdx = 0, stageIdx = 0;
+	u16 *stage       = (u16 *)malloc(VID_FRAME_SIZE);
+	u32 vIdx         = 0;
+	u32 stageMs      = 0;
 	bool videoMore   = vidReadChunk(fv, CHUNK_VIDEO, &vIdx, gfx, VID_FRAME_SIZE);
 	bool stageFilled = false;
 	if(videoMore) {
 		u32 next;
 		if(vidReadChunk(fv, CHUNK_VIDEO, &next, stage, VID_FRAME_SIZE)) {
-			stageIdx    = next;
+			stageMs     = timed ? next : (u32)((u64)next * 1000 / fps);
 			stageFilled = true;
 		} else {
 			videoMore = false;
@@ -543,13 +581,14 @@ static void playVideo(u16 *gfx, int num) {
 			}
 		}
 
-		// Show the staged frame once its pacing slot is due.
-		if(stageFilled && (u64)played * fps >= (u64)stageIdx * rate) {
+		// Show the staged frame once its capture time is due.
+		u32 playedMs = (u32)((u64)played * 1000 / rate);
+		if(stageFilled && playedMs >= stageMs) {
 			memcpy(gfx, stage, VID_FRAME_SIZE);
 			stageFilled = false;
 			u32 next;
 			if(vidReadChunk(fv, CHUNK_VIDEO, &next, stage, VID_FRAME_SIZE)) {
-				stageIdx    = next;
+				stageMs     = timed ? next : (u32)((u64)next * 1000 / fps);
 				stageFilled = true;
 			} else {
 				videoMore = false;
@@ -563,7 +602,7 @@ static void playVideo(u16 *gfx, int num) {
 		int sec = (int)(played / rate);
 		if(sec != lastSec) {
 			lastSec = sec;
-			char msg[32];
+			char msg[40];
 			sprintf(msg,
 					"PLAYING %d:%02d / %lu:%02lu",
 					sec / 60,
@@ -583,8 +622,9 @@ static void playVideo(u16 *gfx, int num) {
 }
 
 // Records video + mic audio to a .VID container until L/R is tapped again (or
-// the lid closes / power is tapped). Frames are paced to VID_FPS on the wall
-// clock; if the SD card falls behind, video frames are dropped (never audio).
+// the lid closes / power is tapped). Frames are taken at the camera's own pace,
+// throttled to VID_FPS, and each one is stamped with its capture time; if the
+// SD card falls behind, video frames are dropped (never audio).
 static void recordVideo(u16 *gfx, int num) {
 	char path[40];
 	vidPath(path, num);
@@ -613,13 +653,13 @@ static void recordVideo(u16 *gfx, int num) {
 	s_vidFreeHead = s_vidFreeTail = 0;
 	s_audFreeHead = s_audFreeTail = 0;
 	s_audBlockIdx = s_audDropped = 0;
-	u32 framesKept = 0, framesDropped = 0, frameIdx = 0;
+	u32 framesKept = 0, framesDropped = 0;
 
 	// Start the ARM7 mic recorder (it NDMA-drains MICEX into the shared ring).
 	pmMicSetAmp(true, PmMicGain_80);
 	armDCacheFlush(s_micRing, sizeof(s_micRing));
 	s_micLastDone = 0;
-	u32 micAddr = (u32)s_micRing;
+	u32 micAddr   = (u32)s_micRing;
 	pxiSendAndReceive(PXI_CAMERA, CAM_MIC_ADDR_LO);
 	pxiSendAndReceive(PXI_CAMERA, micAddr & 0xFFFF);
 	pxiSendAndReceive(PXI_CAMERA, CAM_MIC_ADDR_HI);
@@ -627,13 +667,20 @@ static void recordVideo(u16 *gfx, int num) {
 	pxiSendAndReceive(PXI_CAMERA, CAM_MIC_START);
 	pxiSendAndReceive(PXI_CAMERA, CAM_LED_BLINK); // recording indicator
 
-	// Paced by vblank count (~59.8Hz): keep a frame every keepEvery vblanks.
-	u32 vbl        = 0;
-	u32 keepEvery  = 60 / VID_FPS;
-	u32 lastKeep   = 0;
-	int lastSec    = -1;
-	bool stop      = false;
-	time_t recTime = time(NULL); // watermark clock: start + elapsed seconds
+	// Use the viewfinder stream that is already running. Restarting it here
+	// costs a CAM_CNT flush and leaves the first frames blank, which shows up
+	// as a freeze right at the start of the clip.
+	streamStart();
+
+	u32 vbl         = 0; // wall clock since record start, ~59.8Hz
+	u32 keepEvery   = 1000 / VID_FPS;
+	u32 nextKeep    = 0;
+	u32 lastFrameMs = 0; // newest camera frame, for the worst-gap readout
+	u32 maxGapMs    = 0;
+	bool firstFrame = true;
+	int lastSec     = -1;
+	bool stop       = false;
+	time_t recTime  = time(NULL); // watermark clock: start + elapsed seconds
 
 	while(!stop) {
 		swiWaitForVBlank();
@@ -642,25 +689,43 @@ static void recordVideo(u16 *gfx, int num) {
 		if(keysDown() & (KEY_L | KEY_R) || (keysHeld() & KEY_LID) || pmShouldReset())
 			stop = true;
 
-		if(!cameraTransferActive()) {
-			if(vbl - lastKeep >= keepEvery) {
-				lastKeep = lastKeep ? lastKeep + keepEvery : vbl;
-				// frameIdx counts pacing slots (not kept frames), so dropped
-				// frames leave index gaps that playback/conversion can
-				// duplicate over — A/V sync survives drops.
+		u32 nowMs = (u32)((u64)vbl * 1000 / 60);
+
+		// The camera hands over whole frames; copying one to the screen keeps
+		// the viewfinder live, and the throttled copy goes into the ring.
+		u16 *frame = cameraNextFrame();
+		if(frame) {
+			memcpy(gfx, frame, VID_FRAME_SIZE);
+			// Worst hole in the stream, including the wait before the first
+			// frame: a frozen head shows up here, not in D/O.
+			if(!lastFrameMs) {
+				if(nowMs > maxGapMs)
+					maxGapMs = nowMs;
+			} else if(nowMs - lastFrameMs > maxGapMs) {
+				maxGapMs = nowMs - lastFrameMs;
+			}
+			lastFrameMs = nowMs;
+
+			if(firstFrame || nowMs >= nextKeep) {
+				firstFrame = false;
+				// Fixed schedule, not "100ms since the last kept frame": at a
+				// sensor rate just above VID_FPS that would skip every second
+				// frame and halve the recorded rate.
+				nextKeep += keepEvery;
+				if((s32)(nowMs - nextKeep) > 2 * (s32)keepEvery)
+					nextKeep = nowMs + keepEvery; // fell behind; don't burst
 				if(s_vidFreeTail == s_vidFreeHead + VID_SLOTS) {
 					framesDropped++;
-					frameIdx++;
 				} else {
 					int slot = s_vidFree[s_vidFreeTail++ % VID_SLOTS];
-					memcpy(s_vidRing[slot], gfx, VID_FRAME_SIZE);
+					memcpy(s_vidRing[slot], frame, VID_FRAME_SIZE);
 					// Stamped on the ring copy, never on gfx: the viewfinder
 					// stays clean and the camera DMA can't race the text.
 					if(s_timestamp)
-						watermarkFrame(s_vidRing[slot], recTime + vbl / 60);
+						watermarkFrame(s_vidRing[slot], recTime + nowMs / 1000);
 					Job *job  = &s_vidJobs[slot];
 					job->type = CHUNK_VIDEO;
-					job->aux  = frameIdx++;
+					job->aux  = nowMs; // capture time, ms into the clip
 					job->slot = (u32)slot;
 					job->size = VID_FRAME_SIZE;
 					job->buf  = s_vidRing[slot];
@@ -673,7 +738,6 @@ static void recordVideo(u16 *gfx, int num) {
 					}
 				}
 			}
-			cameraTransferStart(gfx, CAPTURE_MODE_PREVIEW); // re-arm viewfinder
 		}
 
 		micDrain();
@@ -690,16 +754,19 @@ static void recordVideo(u16 *gfx, int num) {
 	pxiSendAndReceive(PXI_CAMERA, CAM_MIC_STOP);
 	pxiSendAndReceive(PXI_CAMERA, CAM_LED_OFF);
 	pmMicSetAmp(false, 0);
-	micDrain(); // pick up the last completed buffers
-	while(cameraTransferActive())
-		swiWaitForVBlank();
-	cameraTransferStop();
+	micDrain();   // pick up the last completed buffers
+	streamStop(); // no waiting on a possibly wedged DMA
 
 	// Let the worker finish the remaining chunks, then patch the totals.
 	uiStatus("SAVING...");
 	while(JOBS_PENDING)
 		swiWaitForVBlank();
-	hdr[8] = frameIdx;                            // timeline length in frames (incl. dropped slots)
+	u32 durMs = (u32)((u64)vbl * 1000 / 60);
+	u32 fps10 = durMs ? (framesKept * 10000 + durMs / 2) / durMs : VID_FPS * 10; // tenths
+	if(fps10 == 0)
+		fps10 = 1;
+	hdr[4] = (fps10 + 5) / 10; // measured fps, for the header/duration
+	hdr[8] = framesKept;
 	hdr[9] = (s_audBlockIdx * MIC_BUF_BYTES) / 2; // total samples
 	fseek(f, 0, SEEK_SET);
 	fwrite(hdr, sizeof(hdr), 1, f);
@@ -718,11 +785,24 @@ static void recordVideo(u16 *gfx, int num) {
 		fclose(f);
 	}
 
-	char msg[36];
-	sprintf(msg, "SAVED VID_%04d%s", num, framesDropped ? " (DROPPED FRAMES)" : "");
+	// fps and drop counts are the quickest way to see how the capture went.
+	// uiCameraScreen() clears the status strip right after this returns, so
+	// stash it and let the caller re-print it.
+	u32 gapS = maxGapMs / 1000;
+	if(gapS > 999)
+		gapS = 999;
+	char msg[44];
+	sprintf(msg,
+			"VID_%04d %lu.%luFPS D:%lu O:%lu G:%lu.%lus",
+			num,
+			(unsigned long)(fps10 / 10),
+			(unsigned long)(fps10 % 10),
+			(unsigned long)framesDropped,
+			(unsigned long)cameraStreamOverruns(),
+			(unsigned long)gapS,
+			(unsigned long)((maxGapMs / 100) % 10));
 	uiStatus(msg);
-	if(s_audDropped)
-		uiStatus("SAVED VID (DROPPED AUDIO)");
+	snprintf(s_savedMsg, sizeof(s_savedMsg), "%s", msg);
 	uiSpace();
 }
 
@@ -1619,6 +1699,7 @@ int main(int argc, char **argv) {
 	Camera camera = CAM_OUTER;
 	s_camera      = camera;
 	cameraActivate(camera);
+	streamStart(); // continuous viewfinder
 
 	uiCameraScreen(camera, fatInited);
 
@@ -1636,30 +1717,23 @@ int main(int argc, char **argv) {
 			scanKeys();
 			// Lid closed: shut the camera off and sleep until it reopens.
 			if(keysHeld() & KEY_LID) {
-				while(cameraTransferActive())
-					swiWaitForVBlank();
-				cameraTransferStop();
-				cameraDeactivate(camera);
+				lidSleep();
 				drainJobs(); // don't sleep with photos half-written
-				pmEnterSleep();
-				cameraActivate(camera);
 				continue;
 			}
-			if(!cameraTransferActive())
-				cameraTransferStart(gfx, CAPTURE_MODE_PREVIEW);
+			// Blit whatever the camera has produced since the last vblank.
+			u16 *frame = cameraNextFrame();
+			if(frame)
+				memcpy(gfx, frame, VID_FRAME_SIZE);
 			pressed = keysDown();
 		} while(!pressed);
 
 		if(pressed & KEY_A) {
-			// Wait for previous transfer to finish
-			while(cameraTransferActive())
-				swiWaitForVBlank();
-			cameraTransferStop();
-
 			// Switch camera
 			camera   = camera == CAM_INNER ? CAM_OUTER : CAM_INNER;
 			s_camera = camera;
 			cameraActivate(camera);
+			streamStart();
 
 			uiCameraScreen(camera, fatInited);
 		} else if(fatInited && pressed & KEY_Y) {
@@ -1673,14 +1747,17 @@ int main(int argc, char **argv) {
 		} else if(fatInited && pressed & (KEY_L | KEY_R)) {
 			if(s_videoMode) {
 				// Tap L/R to record, tap again to stop.
-				while(cameraTransferActive())
-					swiWaitForVBlank();
 				drainJobs(); // finish any pending photo writes first
+				s_savedMsg[0] = '\0';
 				recordVideo(gfx, s_nextVidNum++);
+				streamStart(); // recordVideo left the camera idle
 				uiCameraScreen(camera, fatInited);
+				if(s_savedMsg[0])
+					uiStatus(s_savedMsg); // survives the redraw above
 			} else {
 				// Hold L/R to keep taking photos continuously. Camera LED
 				// lights while shooting, like a shutter indicator.
+				streamStop(); // photos reconfigure the sensor for 640x480
 				pxiSendAndReceive(PXI_CAMERA, CAM_LED_ON);
 				do {
 					captureRaw(gfx);
@@ -1688,15 +1765,15 @@ int main(int argc, char **argv) {
 					// Don't keep shooting into a closed lid (e.g. in a pocket).
 				} while((keysHeld() & (KEY_L | KEY_R)) && !(keysHeld() & KEY_LID));
 				pxiSendAndReceive(PXI_CAMERA, CAM_LED_OFF);
+				streamStart();
 				uiSpace(); // refresh the free-space line after the burst
 			}
 		} else if(fatInited && pressed & KEY_SELECT) {
 			// Stop the live preview and browse photos.
-			while(cameraTransferActive())
-				swiWaitForVBlank();
-			cameraTransferStop();
+			streamStop();
 			drainJobs(); // so the newest shots are in the list
 			viewer(gfx, camera);
+			streamStart();
 		} else if(pressed & KEY_START) {
 			// Disable camera so the light turns off
 			cameraDeactivate(camera);

@@ -28,24 +28,46 @@ import struct, subprocess, sys, os, tempfile
 
 src, dst = sys.argv[1], sys.argv[2]
 d = open(src, 'rb').read()
-if len(d) < 40 or d[:8] != b'DSIVID01':
+MAGICS = (b'DSIVID01', b'DSIVID02')
+if len(d) < 40 or d[:8] not in MAGICS:
     print(f'{src}: empty or not a dsi-camera video, skipping')
     sys.exit(0)
+timed = d[:8] == b'DSIVID02'  # chunk index is a capture time in ms
 w, h, fps, den, rate, fmt, frames_total, samp_total = struct.unpack('<8I', d[8:40])
 
-# Walk chunks; duplicate the previous frame over index gaps (dropped frames).
-off, frames, pcm, lv = 40, [], b'', -1
+# Walk chunks, then lay frames out on a constant-rate timeline: DSIVID02 chunks
+# carry the real capture time (so a slow or jittery capture still plays at the
+# right speed), DSIVID01 chunks carry a frame index.
+off, frames, stamps, pcm = 40, [], [], b''
 while off + 12 <= len(d):
     t, idx, sz = struct.unpack('<3I', d[off:off+12])
     off += 12
     if t == 1:
-        if frames and idx > lv + 1:
-            frames.extend([frames[-1]] * (idx - lv - 1))
-        lv = idx
         frames.append(d[off:off+sz])
+        stamps.append(idx)
     elif t == 2:
         pcm += d[off:off+sz]
     off += sz
+
+if timed and len(stamps) > 1 and stamps[-1] > stamps[0]:
+    # Real rate of this clip, from its own timestamps.
+    fps = (len(stamps) - 1) * 1000.0 / (stamps[-1] - stamps[0])
+
+if len(frames) > 1:
+    if timed:
+        slots = [round(s * fps / 1000.0) for s in stamps]
+    else:
+        slots = stamps
+    out, lv = [], 0
+    for slot, fr in zip(slots, frames):
+        if slot <= lv and out:
+            continue  # two frames in the same slot: keep the first
+        gap = slot - lv - 1
+        if gap > 0 and out:
+            out.extend([out[-1]] * gap)  # hold the last frame over a gap
+        lv = slot
+        out.append(fr)
+    frames = out
 
 tmp = tempfile.mkdtemp()
 v = os.path.join(tmp, 'v.rgb')
@@ -54,7 +76,7 @@ open(v, 'wb').write(b''.join(frames))
 open(a, 'wb').write(pcm)
 subprocess.run([
     'ffmpeg', '-loglevel', 'error', '-y',
-    '-f', 'rawvideo', '-pix_fmt', 'bgr555', '-s', f'{w}x{h}', '-r', str(fps), '-i', v,
+    '-f', 'rawvideo', '-pix_fmt', 'bgr555', '-s', f'{w}x{h}', '-r', f'{fps:.3f}', '-i', v,
     '-f', 's16le', '-ar', str(rate), '-ac', '1', '-i', a,
     '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', dst,
 ], check=True)
