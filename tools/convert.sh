@@ -24,7 +24,7 @@ for f in VID_*.VID; do
 	mp4="vid/${f%.*}.mp4"
 	[ -f "$mp4" ] && continue
 	if python3 - "$f" "$mp4" <<'EOF'
-import struct, subprocess, sys, os, tempfile
+import math, struct, subprocess, sys, os, tempfile
 
 src, dst = sys.argv[1], sys.argv[2]
 d = open(src, 'rb').read()
@@ -34,6 +34,8 @@ if len(d) < 40 or d[:8] not in MAGICS:
     sys.exit(0)
 timed = d[:8] == b'DSIVID02'  # chunk index is a capture time in ms
 w, h, fps, den, rate, fmt, frames_total, samp_total = struct.unpack('<8I', d[8:40])
+duration_ms = den if timed and den > 1 else 0
+fps = fps or 10
 
 # Walk chunks, then lay frames out on a constant-rate timeline: DSIVID02 chunks
 # carry the real capture time (so a slow or jittery capture still plays at the
@@ -73,6 +75,9 @@ for slot, fr in zip(slots, frames):
         out.extend([out[-1]] * min(slot - lv - 1, 600))  # hold the last frame over a gap
     lv = slot
     out.append(fr)
+# Hold the last frame through stop, including a stalled camera at the end.
+end_slot = math.ceil(duration_ms * fps / 1000.0)
+out.extend([out[-1]] * min(max(0, end_slot - len(out)), 600))
 frames = out
 
 with tempfile.TemporaryDirectory() as tmp:

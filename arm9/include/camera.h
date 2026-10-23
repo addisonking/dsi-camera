@@ -40,7 +40,7 @@ bool cameraDeactivate(Camera cam);
 bool cameraCapture(u16 *dst, CaptureMode mode);
 
 // Continuous preview capture: the camera interface is started once and NDMA1
-// is re-armed from its completion IRQ into one of two internal frame buffers,
+// is re-armed from its completion IRQ into one of three internal frame buffers,
 // so the sensor never has to be stopped/flushed between frames. Only preview
 // mode (256x192) is supported; call cameraCapture for 640x480 shots.
 bool cameraStreamStart(void);

@@ -219,7 +219,8 @@ static int scanRaw(Photo **outPhotos) {
 					   (memcmp(vh, VID_MAGIC, 8) == 0 || memcmp(vh, VID_MAGIC_OLD, 8) == 0)) {
 						// DSIVID02 stores the real length; DSIVID01 and
 						// interrupted recordings fall back to frames/fps.
-						u32 vsec         = vh[5] >= 500 ? vh[5] / 1000 : (vh[4] ? vh[8] / vh[4] : 0);
+						bool hasDuration = memcmp(vh, VID_MAGIC, 8) == 0 && vh[5] > 1;
+						u32 vsec         = hasDuration ? (u32)(((u64)vh[5] + 500) / 1000) : (vh[4] ? vh[8] / vh[4] : 0);
 						u32 asec         = vh[6] ? vh[9] / vh[6] : 0;
 						ph[count].durSec = (u16)(vsec > asec ? vsec : asec);
 					}
@@ -274,9 +275,9 @@ static u8 s_camKey[16];
 // Video frame ring (producer: record loop; consumer: worker).
 static u16 s_vidRing[VID_SLOTS][VID_W * VID_H];
 static Job s_vidJobs[VID_SLOTS];
-static u8 s_vidFree[VID_SLOTS]; // SPSC ring of free slot indices
-static vu32 s_vidFreeHead = 0;  // written by worker
-static vu32 s_vidFreeTail = 0;  // written by record loop
+static vu8 s_vidFree[VID_SLOTS]; // SPSC ring of free slot indices
+static vu32 s_vidFreeHead = 0;   // written by worker
+static vu32 s_vidFreeTail = 0;   // written by record loop
 
 // Audio chunk pool (producer: record loop via micDrain; consumer: worker).
 typedef struct AudioChunk {
@@ -284,7 +285,7 @@ typedef struct AudioChunk {
 	alignas(32) u8 data[MIC_BUF_BYTES];
 } AudioChunk;
 static AudioChunk s_audPool[AUD_CHUNKS];
-static u8 s_audFree[AUD_CHUNKS];
+static vu8 s_audFree[AUD_CHUNKS];
 static vu32 s_audFreeHead = 0;
 static vu32 s_audFreeTail = 0;
 
@@ -360,10 +361,14 @@ static int workerMain(void *arg) {
 				fwrite(hdr, sizeof(hdr), 1, s_vidFile);
 				fwrite(job->buf, job->size, 1, s_vidFile);
 			}
-			if(job->type == CHUNK_VIDEO)
-				s_vidFree[s_vidFreeHead++ % VID_SLOTS] = (u8)job->slot;
-			else
-				s_audFree[s_audFreeHead++ % AUD_CHUNKS] = (u8)job->slot;
+			// Publish the slot before the counter: the main thread can preempt us.
+			if(job->type == CHUNK_VIDEO) {
+				s_vidFree[s_vidFreeHead % VID_SLOTS] = (u8)job->slot;
+				s_vidFreeHead++;
+			} else {
+				s_audFree[s_audFreeHead % AUD_CHUNKS] = (u8)job->slot;
+				s_audFreeHead++;
+			}
 		}
 		s_jobsDone++;
 	}
@@ -553,7 +558,8 @@ static void playVideo(u16 *gfx, int num) {
 	timerStart(0, ClockDivider_1024, 0, NULL); // free-running counter
 	timerElapsed(0);                           // zero the baseline
 
-	u32 durSec = hdr[5] >= 500 ? (hdr[5] + 500) / 1000 : totalFrames / fps;
+	u32 durMs  = timed && hdr[5] > 1 ? hdr[5] : (u32)((u64)totalFrames * 1000 / fps);
+	u32 durSec = (u32)(((u64)durMs + 500) / 1000);
 	if(totalSamples / rate > durSec)
 		durSec = totalSamples / rate;
 	int lastSec       = -1;
@@ -600,7 +606,7 @@ static void playVideo(u16 *gfx, int num) {
 			soundStop(BIT(4));
 			audioStopped = true;
 		}
-		if(!videoMore && !stageFilled && audioDone)
+		if(!videoMore && !stageFilled && audioDone && playedMs >= durMs)
 			break;
 
 		int sec = (int)(played / rate);
