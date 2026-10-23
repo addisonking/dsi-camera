@@ -148,6 +148,12 @@ bool cameraCapture(u16 *dst, CaptureMode mode) {
 	cameraStreamStop();
 	camConfigure(mode);
 
+	u32 bytes = mode == CAPTURE_MODE_PREVIEW ? CAM_PREVIEW_SIZE : (640 * 480 * 2);
+
+	// Clean the destination before the DMA: a reuse of this buffer can leave
+	// dirty lines that would otherwise be evicted over the incoming frame.
+	armDCacheFlush(dst, bytes);
+
 	REG_NDMA1SAD  = (u32)&REG_CAM_DAT;
 	REG_NDMA1DAD  = (u32)dst;
 	REG_NDMA1TCNT = (mode == CAPTURE_MODE_PREVIEW ? CAM_PREVIEW_WORDS : (640 * 480) / 2);
@@ -157,7 +163,7 @@ bool cameraCapture(u16 *dst, CaptureMode mode) {
 
 	bool ok = camWaitDone(120); // ~2s at 60Hz
 	if(ok)                      // the DMA wrote around the cache, drop whatever the CPU still has
-		armDCacheInvalidate(dst, mode == CAPTURE_MODE_PREVIEW ? CAM_PREVIEW_SIZE : (640 * 480 * 2));
+		armDCacheInvalidate(dst, bytes);
 	REG_CAM_CNT &= ~BIT(15);
 	return ok;
 }
@@ -178,6 +184,7 @@ bool cameraStreamStart(void) {
 	s_callsWithoutFrame = 0;
 	s_streaming         = true;
 
+	REG_IF = IRQ_NDMA1; // drop a completion latched while the IRQ was masked
 	irqSet(IRQ_NDMA1, camDmaIsr);
 	irqEnable(IRQ_NDMA1);
 
@@ -191,12 +198,12 @@ bool cameraStreamStart(void) {
 }
 
 void cameraStreamStop(void) {
-	if(s_streaming) {
-		irqDisable(IRQ_NDMA1);
-		irqClear(IRQ_NDMA1);
-	}
+	// Kill the transfer first so no completion can be latched between masking
+	// the interrupt and shutting the channel down.
 	REG_NDMA1CNT = 0;
 	REG_CAM_CNT &= ~BIT(15);
+	irqDisable(IRQ_NDMA1);
+	irqClear(IRQ_NDMA1);
 	s_streaming = false;
 }
 
@@ -224,3 +231,5 @@ u16 *cameraNextFrame(void) {
 }
 
 u32 cameraStreamOverruns(void) { return s_overruns; }
+
+bool cameraStreamRunning(void) { return s_streaming; }

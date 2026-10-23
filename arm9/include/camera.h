@@ -48,6 +48,10 @@ bool cameraStreamStart(void);
 // Stops continuous capture (safe to call when not streaming).
 void cameraStreamStop(void);
 
+// True while the continuous stream is armed. Single source of truth for
+// whether the viewfinder should be producing frames.
+bool cameraStreamRunning(void);
+
 // Returns the newest completed frame, or NULL if no new frame arrived since the
 // last call. The pointer is one of two buffers that the camera alternates
 // between, so it stays valid until roughly one frame period later - copy out

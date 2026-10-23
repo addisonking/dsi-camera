@@ -40,33 +40,25 @@ static u16 *s_subGfx;       // bottom-screen bitmap, drawn by the ui* helpers
 static Camera s_camera;     // currently active camera
 static bool s_videoMode;    // camera screen: photo vs video mode
 static bool s_timestamp;    // burn the capture time into saved pixels
-static bool s_streaming;    // viewfinder camera stream is running
 static char s_savedMsg[44]; // last "saved video" summary, kept after the redraw
 static void uiStatus(const char *s);
 void uiSpace(void);
 static void watermarkYuv(u16 *yuv, time_t t);
 static void watermarkFrame(u16 *gfx, time_t t);
 
-// The viewfinder is a continuous camera stream now; keep its state in one
-// place so every path that leaves the camera screen stops it.
+// The viewfinder is a continuous camera stream now. camera.c owns the state;
+// these wrappers just avoid restarting a stream that is already running.
 static void streamStart(void) {
-	if(s_streaming)
-		return;
-	cameraStreamStart();
-	s_streaming = true;
+	if(!cameraStreamRunning())
+		cameraStreamStart();
 }
 
-static void streamStop(void) {
-	if(!s_streaming)
-		return;
-	cameraStreamStop();
-	s_streaming = false;
-}
+static void streamStop(void) { cameraStreamStop(); }
 
 // Lid closed: shut the camera off and sleep until it reopens. Usable from any
 // screen; VRAM survives sleep so nothing needs redrawing after.
 static void lidSleep(void) {
-	bool wasStreaming = s_streaming;
+	bool wasStreaming = cameraStreamRunning();
 	streamStop();
 	cameraDeactivate(s_camera);
 	pmEnterSleep();
@@ -223,7 +215,8 @@ static int scanRaw(Photo **outPhotos) {
 				FILE *vf = fopen(path, "rb");
 				if(vf) {
 					u32 vh[10];
-					if(fread(vh, sizeof(vh), 1, vf) == 1 && memcmp(vh, VID_MAGIC, 8) == 0) {
+					if(fread(vh, sizeof(vh), 1, vf) == 1 &&
+					   (memcmp(vh, VID_MAGIC, 8) == 0 || memcmp(vh, VID_MAGIC_OLD, 8) == 0)) {
 						u32 vsec         = vh[4] ? vh[8] / vh[4] : 0;
 						u32 asec         = vh[6] ? vh[9] / vh[6] : 0;
 						ph[count].durSec = (u16)(vsec > asec ? vsec : asec);
@@ -766,6 +759,8 @@ static void recordVideo(u16 *gfx, int num) {
 	if(fps10 == 0)
 		fps10 = 1;
 	hdr[4] = (fps10 + 5) / 10; // measured fps, for the header/duration
+	if(hdr[4] == 0)
+		hdr[4] = 1;
 	hdr[8] = framesKept;
 	hdr[9] = (s_audBlockIdx * MIC_BUF_BYTES) / 2; // total samples
 	fseek(f, 0, SEEK_SET);
@@ -1717,8 +1712,8 @@ int main(int argc, char **argv) {
 			scanKeys();
 			// Lid closed: shut the camera off and sleep until it reopens.
 			if(keysHeld() & KEY_LID) {
+				drainJobs(); // don't sleep with writes half-finished
 				lidSleep();
-				drainJobs(); // don't sleep with photos half-written
 				continue;
 			}
 			// Blit whatever the camera has produced since the last vblank.
