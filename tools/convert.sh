@@ -23,44 +23,83 @@ for f in VID_*.VID; do
 	[ -f "$f" ] || continue
 	mp4="vid/${f%.*}.mp4"
 	[ -f "$mp4" ] && continue
-	python3 - "$f" "$mp4" <<'EOF'
-import struct, subprocess, sys, os, tempfile
+	if python3 - "$f" "$mp4" <<'EOF'
+import math, struct, subprocess, sys, os, tempfile
 
 src, dst = sys.argv[1], sys.argv[2]
 d = open(src, 'rb').read()
-if len(d) < 40 or d[:8] != b'DSIVID01':
+MAGICS = (b'DSIVID01', b'DSIVID02')
+if len(d) < 40 or d[:8] not in MAGICS:
     print(f'{src}: empty or not a dsi-camera video, skipping')
     sys.exit(0)
+timed = d[:8] == b'DSIVID02'  # chunk index is a capture time in ms
 w, h, fps, den, rate, fmt, frames_total, samp_total = struct.unpack('<8I', d[8:40])
+duration_ms = den if timed and den > 1 else 0
+fps = fps or 10
 
-# Walk chunks; duplicate the previous frame over index gaps (dropped frames).
-off, frames, pcm, lv = 40, [], b'', -1
+# Walk chunks, then lay frames out on a constant-rate timeline: DSIVID02 chunks
+# carry the real capture time (so a slow or jittery capture still plays at the
+# right speed), DSIVID01 chunks carry a frame index.
+off, frames, stamps, pcm = 40, [], [], b''
 while off + 12 <= len(d):
     t, idx, sz = struct.unpack('<3I', d[off:off+12])
     off += 12
     if t == 1:
-        if frames and idx > lv + 1:
-            frames.extend([frames[-1]] * (idx - lv - 1))
-        lv = idx
-        frames.append(d[off:off+sz])
+        chunk = d[off:off + sz]
+        if len(chunk) == w * h * 2:  # fixed-size frames; anything else is bad
+            frames.append(chunk)
+            stamps.append(idx)
     elif t == 2:
         pcm += d[off:off+sz]
     off += sz
 
-tmp = tempfile.mkdtemp()
-v = os.path.join(tmp, 'v.rgb')
-a = os.path.join(tmp, 'a.pcm')
-open(v, 'wb').write(b''.join(frames))
-open(a, 'wb').write(pcm)
-subprocess.run([
-    'ffmpeg', '-loglevel', 'error', '-y',
-    '-f', 'rawvideo', '-pix_fmt', 'bgr555', '-s', f'{w}x{h}', '-r', str(fps), '-i', v,
-    '-f', 's16le', '-ar', str(rate), '-ac', '1', '-i', a,
-    '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', dst,
-], check=True)
-os.remove(v); os.remove(a); os.rmdir(tmp)
+if not frames:
+    print(f'{src}: no video frames, skipping')
+    sys.exit(1)
+
+if timed and len(stamps) > 1 and stamps[-1] > stamps[0] + 50:
+    # Real rate of this clip, from its own timestamps. Clamped so a two-frame
+    # clip can't produce a nonsense rate.
+    fps = max(1.0, min(60.0, (len(stamps) - 1) * 1000.0 / (stamps[-1] - stamps[0])))
+
+slots = [round(s * fps / 1000.0) for s in stamps] if timed else stamps
+out, lv = [], None
+for slot, fr in zip(slots, frames):
+    if lv is None:
+        # audio starts before the first frame; hold that frame so the two
+        # tracks stay lined up (clamped: a corrupt stamp shouldn't eat ram)
+        out.extend([fr] * min(max(0, slot), 600))
+    elif slot <= lv:
+        continue  # two frames in the same slot: keep the first
+    else:
+        out.extend([out[-1]] * min(slot - lv - 1, 600))  # hold the last frame over a gap
+    lv = slot
+    out.append(fr)
+# Hold the last frame through stop, including a stalled camera at the end.
+end_slot = math.ceil(duration_ms * fps / 1000.0)
+out.extend([out[-1]] * min(max(0, end_slot - len(out)), 600))
+frames = out
+
+with tempfile.TemporaryDirectory() as tmp:
+    v = os.path.join(tmp, 'v.rgb')
+    open(v, 'wb').write(b''.join(frames))
+    cmd = [
+        'ffmpeg', '-loglevel', 'error', '-y',
+        '-f', 'rawvideo', '-pix_fmt', 'bgr555', '-s', f'{w}x{h}', '-r', f'{fps:.3f}', '-i', v,
+    ]
+    if pcm:
+        a = os.path.join(tmp, 'a.pcm')
+        open(a, 'wb').write(pcm)
+        cmd += ['-f', 's16le', '-ar', str(rate), '-ac', '1', '-i', a]
+    cmd += ['-c:v', 'libx264', '-pix_fmt', 'yuv420p']
+    if pcm:
+        cmd += ['-c:a', 'aac']
+    cmd.append(dst)
+    subprocess.run(cmd, check=True)
 EOF
-	echo "$f -> $mp4"
-	new=$((new + 1))
+	then
+		echo "$f -> $mp4"
+		new=$((new + 1))
+	fi
 done
 echo "$new new video(s) converted."
