@@ -182,6 +182,9 @@ bool cameraCapture(u16 *dst, CaptureMode mode) {
 }
 
 bool cameraStreamStart(void) {
+	if(activeCamera == CAM_NONE) // nothing to stream from
+		return false;
+
 	cameraStreamStop();
 
 	camConfigure(CAPTURE_MODE_PREVIEW);

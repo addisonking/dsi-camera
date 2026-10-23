@@ -65,12 +65,12 @@ out, lv = [], None
 for slot, fr in zip(slots, frames):
     if lv is None:
         # audio starts before the first frame; hold that frame so the two
-        # tracks stay lined up
-        out.extend([fr] * max(0, slot))
+        # tracks stay lined up (clamped: a corrupt stamp shouldn't eat ram)
+        out.extend([fr] * min(max(0, slot), 600))
     elif slot <= lv:
         continue  # two frames in the same slot: keep the first
     else:
-        out.extend([out[-1]] * (slot - lv - 1))  # hold the last frame over a gap
+        out.extend([out[-1]] * min(slot - lv - 1, 600))  # hold the last frame over a gap
     lv = slot
     out.append(fr)
 frames = out

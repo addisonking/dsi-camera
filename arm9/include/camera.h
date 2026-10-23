@@ -53,13 +53,13 @@ void cameraStreamStop(void);
 bool cameraStreamRunning(void);
 
 // Returns the newest completed frame, or NULL if no new frame arrived since the
-// last call. The pointer is one of two buffers that the camera alternates
-// between, so it stays valid until roughly one frame period later - copy out
-// what you need right away. Cache is invalidated for you.
+// last call. The pointer is one of three buffers the camera rotates through, so
+// it stays valid for about two frame periods - copy out what you need right
+// away. Cache is invalidated for you.
 u16 *cameraNextFrame(void);
 
-// Number of camera FIFO overruns (data dropped between re-arms) since the
-// stream started; nonzero means a frame or two of the stream was lost.
+// Number of camera FIFO overrun episodes (data dropped between re-arms) since
+// boot. Never reset; the recorder reports the delta for its clip.
 u32 cameraStreamOverruns(void);
 
 #ifdef __cplusplus

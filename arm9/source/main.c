@@ -217,7 +217,9 @@ static int scanRaw(Photo **outPhotos) {
 					u32 vh[10];
 					if(fread(vh, sizeof(vh), 1, vf) == 1 &&
 					   (memcmp(vh, VID_MAGIC, 8) == 0 || memcmp(vh, VID_MAGIC_OLD, 8) == 0)) {
-						u32 vsec         = vh[4] ? vh[8] / vh[4] : 0;
+						// DSIVID02 stores the real length; DSIVID01 and
+						// interrupted recordings fall back to frames/fps.
+						u32 vsec         = vh[5] >= 500 ? vh[5] / 1000 : (vh[4] ? vh[8] / vh[4] : 0);
 						u32 asec         = vh[6] ? vh[9] / vh[6] : 0;
 						ph[count].durSec = (u16)(vsec > asec ? vsec : asec);
 					}
@@ -551,7 +553,7 @@ static void playVideo(u16 *gfx, int num) {
 	timerStart(0, ClockDivider_1024, 0, NULL); // free-running counter
 	timerElapsed(0);                           // zero the baseline
 
-	u32 durSec = totalFrames / fps;
+	u32 durSec = hdr[5] >= 500 ? (hdr[5] + 500) / 1000 : totalFrames / fps;
 	if(totalSamples / rate > durSec)
 		durSec = totalSamples / rate;
 	int lastSec       = -1;
@@ -642,7 +644,7 @@ static void recordVideo(u16 *gfx, int num) {
 	hdr[2] = VID_W;
 	hdr[3] = VID_H;
 	hdr[4] = VID_FPS;
-	hdr[5] = 1;
+	hdr[5] = 0; // clip length in ms, patched in at stop (was the fps denominator)
 	hdr[6] = MIC_RATE_HZ;
 	hdr[7] = 1; // s16le mono
 	fwrite(hdr, sizeof(hdr), 1, f);
@@ -656,6 +658,13 @@ static void recordVideo(u16 *gfx, int num) {
 	s_audFreeHead = s_audFreeTail = 0;
 	s_audBlockIdx = s_audDropped = 0;
 	u32 framesKept = 0, framesDropped = 0;
+
+	// Timestamps come off the same free-running clock playback uses, so frame
+	// times can't drift against the audio the way a vblank count does. Start it
+	// before the mic so audio can't lead video t=0.
+	timerStart(0, ClockDivider_1024, 0, NULL);
+	timerElapsed(0);
+	u32 recTicks = 0;
 
 	// Start the ARM7 mic recorder (it NDMA-drains MICEX into the shared ring).
 	pmMicSetAmp(true, PmMicGain_80);
@@ -675,11 +684,6 @@ static void recordVideo(u16 *gfx, int num) {
 	u32 ovStart = cameraStreamOverruns();
 	streamStart();
 
-	// Timestamps come off the same free-running clock playback uses, so frame
-	// times can't drift against the audio the way a vblank count does.
-	timerStart(0, ClockDivider_1024, 0, NULL);
-	timerElapsed(0);
-	u32 recTicks    = 0;
 	u32 keepEvery   = 1000 / VID_FPS;
 	u32 nextKeep    = 0;
 	u32 lastFrameMs = 0; // newest camera frame, for the worst-gap readout
@@ -773,9 +777,10 @@ static void recordVideo(u16 *gfx, int num) {
 	u32 fps10 = durMs ? (framesKept * 10000 + durMs / 2) / durMs : VID_FPS * 10; // tenths
 	if(fps10 == 0)
 		fps10 = 1;
-	hdr[4] = (fps10 + 5) / 10; // measured fps, for the header/duration
+	hdr[4] = (fps10 + 5) / 10; // measured fps, for the header
 	if(hdr[4] == 0)
 		hdr[4] = 1;
+	hdr[5] = durMs; // exact length; frames/fps is rounded and reads short
 	hdr[8] = framesKept;
 	hdr[9] = (s_audBlockIdx * MIC_BUF_BYTES) / 2; // total samples
 	fseek(f, 0, SEEK_SET);
