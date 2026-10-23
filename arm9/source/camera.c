@@ -25,27 +25,40 @@ CaptureMode activeMode = CAPTURE_MODE_PREVIEW;
 #define CAM_NDMA_CFG 0xCB044000u // start | irq enable | camera timing | 16-word blocks | fixed src
 #define CAM_NDMA_ONE 0x8B044000u // same, without the completion IRQ
 
-// Two alternating frame buffers in main RAM. The ISR writes the next frame into
-// one while the ARM9 reads the other. Cache line aligned so invalidating a
-// finished frame never touches neighbouring data.
-alignas(32) static u16 s_frames[2][256 * 192];
+// Frame buffers in main RAM. The ISR writes the next frame into one while the
+// ARM9 reads another; the third absorbs a consumer that is a frame late.
+// Cache line aligned so invalidating a finished frame never touches
+// neighbouring data.
+#define CAM_FRAMES 3
+alignas(32) static u16 s_frames[CAM_FRAMES][256 * 192];
 
 static bool s_streaming;
 static bool s_modeValid;          // sensor is known to be in activeMode
 static volatile u32 s_frameCount; // frames completed since stream start
 static volatile u8 s_fill;        // buffer the camera is writing right now
-static volatile u32 s_overruns;   // CAM_CNT.4 events seen in the ISR
+static volatile u32 s_overruns;   // CAM_CNT.4 episodes seen in the ISR
+static bool s_overrunSeen;        // CAM_CNT.4 stays latched until a flush
 static u32 s_seen;                // frames handed to the caller so far
 static u32 s_callsWithoutFrame;   // stall watchdog for cameraNextFrame
 
 // Re-arm straight from the completion IRQ so the gap between frames is a few
 // microseconds, not the time it takes the main loop to notice and copy.
 static void camDmaIsr(void) {
-	int next = s_fill ^ 1;
-	s_fill   = (u8)next;
+	int next = s_fill + 1;
+	if(next == CAM_FRAMES)
+		next = 0;
+	s_fill = (u8)next;
 	s_frameCount++;
-	if(REG_CAM_CNT & BIT(4))
-		s_overruns++;
+
+	// Bit 4 latches until it is cleared with bit 5, so count episodes, not
+	// every frame that happens to still see it.
+	if(REG_CAM_CNT & BIT(4)) {
+		if(!s_overrunSeen)
+			s_overruns++;
+		s_overrunSeen = true;
+	} else {
+		s_overrunSeen = false;
+	}
 
 	REG_NDMA1DAD  = (u32)s_frames[next];
 	REG_NDMA1TCNT = CAM_PREVIEW_WORDS;
@@ -180,7 +193,7 @@ bool cameraStreamStart(void) {
 	s_fill              = 0;
 	s_frameCount        = 0;
 	s_seen              = 0;
-	s_overruns          = 0;
+	s_overrunSeen       = false;
 	s_callsWithoutFrame = 0;
 	s_streaming         = true;
 
@@ -198,11 +211,12 @@ bool cameraStreamStart(void) {
 }
 
 void cameraStreamStop(void) {
-	// Kill the transfer first so no completion can be latched between masking
-	// the interrupt and shutting the channel down.
+	// Mask first so the ISR can't re-arm the channel behind our back, then
+	// shut it down and drop any completion that latched in between.
+	irqDisable(IRQ_NDMA1);
 	REG_NDMA1CNT = 0;
 	REG_CAM_CNT &= ~BIT(15);
-	irqDisable(IRQ_NDMA1);
+	REG_IF = IRQ_NDMA1;
 	irqClear(IRQ_NDMA1);
 	s_streaming = false;
 }
@@ -222,10 +236,10 @@ u16 *cameraNextFrame(void) {
 
 	s_callsWithoutFrame = 0;
 
-	// With two buffers only the newest frame is guaranteed intact; anything
-	// older is already being overwritten by the camera.
+	// With three buffers the frame we hand out is two completions away from
+	// being written again; anything older is already gone.
 	s_seen = count;
-	u16 *f = s_frames[(count - 1) & 1];
+	u16 *f = s_frames[(count - 1) % CAM_FRAMES];
 	armDCacheInvalidate(f, CAM_PREVIEW_SIZE);
 	return f;
 }

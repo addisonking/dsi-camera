@@ -40,7 +40,7 @@ static u16 *s_subGfx;       // bottom-screen bitmap, drawn by the ui* helpers
 static Camera s_camera;     // currently active camera
 static bool s_videoMode;    // camera screen: photo vs video mode
 static bool s_timestamp;    // burn the capture time into saved pixels
-static char s_savedMsg[44]; // last "saved video" summary, kept after the redraw
+static char s_savedMsg[48]; // last "saved video" summary, kept after the redraw
 static void uiStatus(const char *s);
 void uiSpace(void);
 static void watermarkYuv(u16 *yuv, time_t t);
@@ -443,7 +443,8 @@ static bool vidReadChunk(FILE *f, u32 wantType, u32 *outIdx, void *buf, u32 bufS
 		if(fread(hdr, sizeof(hdr), 1, f) != 1)
 			return false;
 		if(hdr[0] == wantType) {
-			if(hdr[2] > bufSz) // corrupt chunk of the type we want
+			// video chunks are fixed size; anything else is corruption
+			if(hdr[2] > bufSz || (wantType == CHUNK_VIDEO && hdr[2] != VID_FRAME_SIZE))
 				return false;
 			*outIdx = hdr[1];
 			return fread(buf, hdr[2], 1, f) == 1;
@@ -515,6 +516,7 @@ static void playVideo(u16 *gfx, int num) {
 	u32 vIdx         = 0;
 	u32 stageMs      = 0;
 	bool videoMore   = vidReadChunk(fv, CHUNK_VIDEO, &vIdx, gfx, VID_FRAME_SIZE);
+	bool haveFrame   = videoMore;
 	bool stageFilled = false;
 	if(videoMore) {
 		u32 next;
@@ -526,7 +528,7 @@ static void playVideo(u16 *gfx, int num) {
 		}
 	}
 
-	if(!videoMore && totalSamples == 0) {
+	if(!haveFrame && totalSamples == 0) {
 		uiStatus("EMPTY VIDEO");
 		fclose(fa);
 		fclose(fv);
@@ -552,7 +554,8 @@ static void playVideo(u16 *gfx, int num) {
 	u32 durSec = totalFrames / fps;
 	if(totalSamples / rate > durSec)
 		durSec = totalSamples / rate;
-	int lastSec = -1;
+	int lastSec       = -1;
+	bool audioStopped = false;
 
 	for(;;) {
 		swiWaitForVBlank();
@@ -589,6 +592,12 @@ static void playVideo(u16 *gfx, int num) {
 		}
 
 		bool audioDone = !audioMore && played >= (u64)fedChunks * PLAY_RING_HALF;
+		if(audioDone && !audioStopped) {
+			// the looping channel would otherwise repeat the last half for as
+			// long as the video outlasts the audio
+			soundStop(BIT(4));
+			audioStopped = true;
+		}
 		if(!videoMore && !stageFilled && audioDone)
 			break;
 
@@ -663,9 +672,14 @@ static void recordVideo(u16 *gfx, int num) {
 	// Use the viewfinder stream that is already running. Restarting it here
 	// costs a CAM_CNT flush and leaves the first frames blank, which shows up
 	// as a freeze right at the start of the clip.
+	u32 ovStart = cameraStreamOverruns();
 	streamStart();
 
-	u32 vbl         = 0; // wall clock since record start, ~59.8Hz
+	// Timestamps come off the same free-running clock playback uses, so frame
+	// times can't drift against the audio the way a vblank count does.
+	timerStart(0, ClockDivider_1024, 0, NULL);
+	timerElapsed(0);
+	u32 recTicks    = 0;
 	u32 keepEvery   = 1000 / VID_FPS;
 	u32 nextKeep    = 0;
 	u32 lastFrameMs = 0; // newest camera frame, for the worst-gap readout
@@ -677,12 +691,12 @@ static void recordVideo(u16 *gfx, int num) {
 
 	while(!stop) {
 		swiWaitForVBlank();
-		vbl++;
 		scanKeys();
 		if(keysDown() & (KEY_L | KEY_R) || (keysHeld() & KEY_LID) || pmShouldReset())
 			stop = true;
 
-		u32 nowMs = (u32)((u64)vbl * 1000 / 60);
+		recTicks += timerElapsed(0);
+		u32 nowMs = (u32)((u64)recTicks * 1000 / PLAY_TIMER_HZ);
 
 		// The camera hands over whole frames; copying one to the screen keeps
 		// the viewfinder live, and the throttled copy goes into the ring.
@@ -735,7 +749,7 @@ static void recordVideo(u16 *gfx, int num) {
 
 		micDrain();
 
-		int sec = (int)(vbl / 60);
+		int sec = (int)(nowMs / 1000);
 		if(sec != lastSec) {
 			lastSec = sec;
 			char msg[24];
@@ -744,6 +758,7 @@ static void recordVideo(u16 *gfx, int num) {
 		}
 	}
 
+	timerStop(0);
 	pxiSendAndReceive(PXI_CAMERA, CAM_MIC_STOP);
 	pxiSendAndReceive(PXI_CAMERA, CAM_LED_OFF);
 	pmMicSetAmp(false, 0);
@@ -754,7 +769,7 @@ static void recordVideo(u16 *gfx, int num) {
 	uiStatus("SAVING...");
 	while(JOBS_PENDING)
 		swiWaitForVBlank();
-	u32 durMs = (u32)((u64)vbl * 1000 / 60);
+	u32 durMs = (u32)((u64)recTicks * 1000 / PLAY_TIMER_HZ);
 	u32 fps10 = durMs ? (framesKept * 10000 + durMs / 2) / durMs : VID_FPS * 10; // tenths
 	if(fps10 == 0)
 		fps10 = 1;
@@ -786,16 +801,18 @@ static void recordVideo(u16 *gfx, int num) {
 	u32 gapS = maxGapMs / 1000;
 	if(gapS > 999)
 		gapS = 999;
-	char msg[44];
-	sprintf(msg,
-			"VID_%04d %lu.%luFPS D:%lu O:%lu G:%lu.%lus",
-			num,
-			(unsigned long)(fps10 / 10),
-			(unsigned long)(fps10 % 10),
-			(unsigned long)framesDropped,
-			(unsigned long)cameraStreamOverruns(),
-			(unsigned long)gapS,
-			(unsigned long)((maxGapMs / 100) % 10));
+	char msg[48];
+	snprintf(msg,
+			 sizeof(msg),
+			 "VID_%04d %lu.%luFPS D:%lu A:%lu O:%lu G:%lu.%lus",
+			 num,
+			 (unsigned long)(fps10 / 10),
+			 (unsigned long)(fps10 % 10),
+			 (unsigned long)framesDropped,
+			 (unsigned long)s_audDropped,
+			 (unsigned long)(cameraStreamOverruns() - ovStart),
+			 (unsigned long)gapS,
+			 (unsigned long)((maxGapMs / 100) % 10));
 	uiStatus(msg);
 	snprintf(s_savedMsg, sizeof(s_savedMsg), "%s", msg);
 	uiSpace();

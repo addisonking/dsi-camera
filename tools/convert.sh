@@ -43,8 +43,10 @@ while off + 12 <= len(d):
     t, idx, sz = struct.unpack('<3I', d[off:off+12])
     off += 12
     if t == 1:
-        frames.append(d[off:off+sz])
-        stamps.append(idx)
+        chunk = d[off:off + sz]
+        if len(chunk) == w * h * 2:  # fixed-size frames; anything else is bad
+            frames.append(chunk)
+            stamps.append(idx)
     elif t == 2:
         pcm += d[off:off+sz]
     off += sz
@@ -58,21 +60,20 @@ if timed and len(stamps) > 1 and stamps[-1] > stamps[0] + 50:
     # clip can't produce a nonsense rate.
     fps = max(1.0, min(60.0, (len(stamps) - 1) * 1000.0 / (stamps[-1] - stamps[0])))
 
-if len(frames) > 1:
-    slots = [round(s * fps / 1000.0) for s in stamps] if timed else stamps
-    out, lv = [], None
-    for slot, fr in zip(slots, frames):
-        if lv is None:
-            # audio starts before the first frame; hold that frame so the two
-            # tracks stay lined up
-            out.extend([fr] * max(0, slot))
-        elif slot <= lv:
-            continue  # two frames in the same slot: keep the first
-        else:
-            out.extend([out[-1]] * (slot - lv - 1))  # hold the last frame over a gap
-        lv = slot
-        out.append(fr)
-    frames = out
+slots = [round(s * fps / 1000.0) for s in stamps] if timed else stamps
+out, lv = [], None
+for slot, fr in zip(slots, frames):
+    if lv is None:
+        # audio starts before the first frame; hold that frame so the two
+        # tracks stay lined up
+        out.extend([fr] * max(0, slot))
+    elif slot <= lv:
+        continue  # two frames in the same slot: keep the first
+    else:
+        out.extend([out[-1]] * (slot - lv - 1))  # hold the last frame over a gap
+    lv = slot
+    out.append(fr)
+frames = out
 
 with tempfile.TemporaryDirectory() as tmp:
     v = os.path.join(tmp, 'v.rgb')
