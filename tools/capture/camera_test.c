@@ -21,9 +21,18 @@ u32 REG_SCFG_CLK, REG_IF;
 static unsigned sensorLines, sensorGain, exposureCalls;
 static unsigned failures;
 static bool failMode;
+static bool failLight, light;
+static unsigned lightWrites;
 
 u32 pxiSendAndReceive(unsigned channel, u32 command) {
 	assert(channel == PXI_CAMERA);
+	if(command == CAM_REAR_LIGHT_ON || command == CAM_REAR_LIGHT_OFF) {
+		lightWrites++;
+		if(failLight)
+			return 0;
+		light = command == CAM_REAR_LIGHT_ON;
+		return 1;
+	}
 	if(command & CAM_EXPOSURE_REQUEST) {
 		exposureCalls++;
 		if(failures) {
@@ -111,5 +120,26 @@ int main(void) {
 	assert(cameraDeactivate(CAM_INNER));
 	pollPreview();
 	assert(!cameraStreamRunning());
+	assert(cameraExposureError(EXPOSURE_ERROR_STAGE));
+	assert(!cameraSetExposure(64, 0));
+	assert(!cameraExposureError(EXPOSURE_ERROR_STAGE));
+	assert(!cameraExposureError(EXPOSURE_ERROR_REGISTER));
+
+	// A recovered preview retries a light write that failed alongside it.
+	assert(cameraActivate(CAM_OUTER));
+	failLight = failMode = true;
+	assert(!cameraSetRearLight(true));
+	assert(!cameraStreamStart());
+	failLight = failMode = false;
+	pollPreview();
+	assert(cameraStreamRunning() && light);
+	assert(cameraSetRearLight(false));
+	unsigned writes = lightWrites;
+	cameraStreamStop();
+	pollPreview();
+	assert(!light && lightWrites == writes);
+	assert(cameraStreamStart());
+	pollPreview();
+	assert(!light && lightWrites == writes + 1);
 	puts("camera: apply/rollback faults, preview retry, mode entry, capture and intentional stop passed");
 }

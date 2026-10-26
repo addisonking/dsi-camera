@@ -34,6 +34,7 @@ alignas(32) static u16 s_frames[CAM_FRAMES][256 * 192];
 
 static bool s_streaming;
 static bool s_streamRequested;
+static bool s_rearLight = true;
 static unsigned s_exposureLines;
 static unsigned s_exposureGain;
 static u16 s_exposureError[EXPOSURE_ERROR_FIELDS];
@@ -117,6 +118,7 @@ bool cameraActivate(Camera cam) {
 }
 
 bool cameraSetRearLight(bool enabled) {
+	s_rearLight = enabled;
 	return pxiSendAndReceive(PXI_CAMERA, enabled ? CAM_REAR_LIGHT_ON : CAM_REAR_LIGHT_OFF) == 1;
 }
 
@@ -202,12 +204,12 @@ static bool camApplyExposure(unsigned lines, unsigned gain) {
 }
 
 bool cameraSetExposure(unsigned lines, unsigned gain) {
+	for(unsigned i = 0; i < EXPOSURE_ERROR_FIELDS; i++)
+		s_exposureError[i] = 0;
 	if(lines > CAM_EXPOSURE_MAX_LINES || gain > 3 || activeCamera == CAM_NONE)
 		return false;
 	bool resume       = s_streamRequested;
 	unsigned oldLines = s_exposureLines, oldGain = s_exposureGain;
-	for(unsigned i = 0; i < EXPOSURE_ERROR_FIELDS; i++)
-		s_exposureError[i] = 0;
 	cameraStreamStop();
 	bool ok = camApplyExposure(lines, gain);
 	if(resume && !cameraStreamStart()) {
@@ -307,7 +309,8 @@ u16 *cameraNextFrame(void) {
 		// picture forever. Callers poll once per vblank.
 		if(s_streamRequested && ++s_callsWithoutFrame > 240) {
 			s_callsWithoutFrame = 0;
-			cameraStreamStart();
+			if(cameraStreamStart())
+				cameraSetRearLight(s_rearLight);
 		}
 		return NULL;
 	}

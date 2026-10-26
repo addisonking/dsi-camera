@@ -59,7 +59,7 @@ static void drainJobs(void);
 static void streamStart(void) {
 	bool lightReady = cameraSetRearLight(s_rearLight);
 	if(!cameraStreamRunning() && !cameraStreamStart())
-		uiStatus("PREVIEW FAILED - TRY AGAIN");
+		uiStatus(lightReady ? "PREVIEW FAILED - TRY AGAIN" : "PREVIEW AND REAR LIGHT FAILED");
 	else if(!lightReady)
 		uiStatus("REAR LIGHT SETTING FAILED");
 }
@@ -2022,9 +2022,9 @@ int main(int argc, char **argv) {
 		cameraSetExposure(0, 0);
 	}
 	uiCameraScreen(camera, fatInited);
-	streamStart(); // continuous viewfinder
 	if(!exposureReady)
 		uiStatus("SAVED EXPOSURE SETTING FAILED");
+	streamStart(); // continuous viewfinder
 
 	while(1) {
 		u16 pressed = 0;
