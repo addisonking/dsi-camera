@@ -12,7 +12,10 @@ extern "C" {
 void init(u8 device);
 void activate(u8 device);
 void deactivate(u8 device);
-void setMode(CaptureMode mode);
+bool setRearLight(bool enabled);
+bool setMode(CaptureMode mode);
+bool setExposure(unsigned lines, unsigned gain);
+unsigned exposureError(ExposureErrorField field);
 
 #ifdef __cplusplus
 }

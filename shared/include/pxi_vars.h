@@ -37,8 +37,29 @@ typedef enum {
 	// Power LED (BPTWL reg 0x63): OFF = blue, ON/BLINK = red (shutter/REC cue).
 	CAM_LED_OFF,
 	CAM_LED_ON,
-	CAM_LED_BLINK
+	CAM_LED_BLINK,
+	CAM_GET_EXPOSURE_ERROR_STAGE,
+	CAM_GET_EXPOSURE_ERROR_REGISTER,
+	CAM_GET_EXPOSURE_ERROR_EXPECTED,
+	CAM_GET_EXPOSURE_ERROR_OBSERVED,
+	CAM_REAR_LIGHT_OFF,
+	CAM_REAR_LIGHT_ON
 } PxiCommand;
+
+// Packed exposure request fits PXI's 26-bit immediate; halfword mic addresses
+// cannot be mistaken for one. Zero lines restores the sensor's auto exposure.
+#define CAM_EXPOSURE_REQUEST (1u << 24)
+#define CAM_EXPOSURE_LINES_MASK 0x3FFu
+#define CAM_EXPOSURE_GAIN_SHIFT 10
+#define CAM_EXPOSURE_MAX_LINES 640
+
+typedef enum {
+	EXPOSURE_ERROR_STAGE,
+	EXPOSURE_ERROR_REGISTER,
+	EXPOSURE_ERROR_EXPECTED,
+	EXPOSURE_ERROR_OBSERVED,
+	EXPOSURE_ERROR_FIELDS
+} ExposureErrorField;
 
 // Mic ring layout: u32 completion counter at the base, then MIC_RING_BUFS
 // buffers of MIC_BUF_BYTES each (base + 32).

@@ -34,10 +34,18 @@ bool cameraActivate(Camera cam);
 // Deactivates a camera
 bool cameraDeactivate(Camera cam);
 
+// Rear camera indicator light; stays off while the inner camera is active.
+bool cameraSetRearLight(bool enabled);
+
 // Grabs a single frame into dst (RAM or VRAM) and leaves the camera stopped.
 // The camera interface is (re)configured per call, so this is cheap only for
 // snapshots. Returns false if the transfer did not finish (camera stalled).
 bool cameraCapture(u16 *dst, CaptureMode mode);
+
+// Real sensor integration in rows (0 = auto), analogue gain 1x/2x/4x/8x.
+// Applied again after mode changes; false means register verification failed.
+bool cameraSetExposure(unsigned lines, unsigned gain);
+unsigned cameraExposureError(ExposureErrorField field);
 
 // Continuous preview capture: the camera interface is started once and NDMA1
 // is re-armed from its completion IRQ into one of three internal frame buffers,

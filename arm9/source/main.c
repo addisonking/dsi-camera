@@ -1,4 +1,5 @@
 #include "camera.h"
+#include "night.h"
 #include "version.h"
 
 #include <calico/arm/cache.h>
@@ -39,12 +40,19 @@ int clamp(int val, int min, int max) { return val < min ? min : (val > max ? max
 static u16 *s_subGfx;       // bottom-screen bitmap, drawn by the ui* helpers
 static Camera s_camera;     // currently active camera
 static bool s_videoMode;    // camera screen: photo vs video mode
+static const unsigned s_shutterLines[] = {0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 640};
+#define SHUTTER_COUNT (sizeof(s_shutterLines) / sizeof(s_shutterLines[0]))
+static unsigned s_shutter;
+static unsigned s_gain;
+static bool s_nightBurst;
+static bool s_rearLight = true;
 static bool s_timestamp;    // burn the capture time into saved pixels
 static char s_savedMsg[48]; // last "saved video" summary, kept after the redraw
 static void uiStatus(const char *s);
 void uiSpace(void);
 static void watermarkYuv(u16 *yuv, time_t t);
 static void watermarkFrame(u16 *gfx, time_t t);
+static void drainJobs(void);
 
 // The viewfinder is a continuous camera stream now. camera.c owns the state;
 // these wrappers just avoid restarting a stream that is already running.
@@ -60,8 +68,16 @@ static void streamStop(void) { cameraStreamStop(); }
 static void lidSleep(void) {
 	bool wasStreaming = cameraStreamRunning();
 	streamStop();
+	drainJobs();
+	if(pmShouldReset())
+		return;
 	cameraDeactivate(s_camera);
-	pmEnterSleep();
+	// Saving and sensor standby can take long enough for the lid to reopen.
+	scanKeys();
+	if((keysHeld() & KEY_LID) && !pmShouldReset())
+		pmEnterSleep();
+	if(pmShouldReset())
+		return;
 	cameraActivate(s_camera);
 	if(wasStreaming)
 		streamStart();
@@ -138,6 +154,7 @@ static void yuvToRgb(const u16 *yuv, u8 *rgb) {
 
 static void rawPath(char *out, int num) { sprintf(out, RAW_DIR "/IMG_%04d.YUV", num); }
 static void thumbPath(char *out, int num) { sprintf(out, RAW_DIR "/IMG_%04d.THM", num); }
+static void metadataPath(char *out, int num) { sprintf(out, RAW_DIR "/IMG_%04d.TXT", num); }
 static void vidPath(char *out, int num) { sprintf(out, RAW_DIR "/VID_%04d.VID", num); }
 static void vidThumbPath(char *out, int num) { sprintf(out, RAW_DIR "/VID_%04d.THM", num); }
 
@@ -150,9 +167,18 @@ static void cfgLoad(void) {
 	if(!f)
 		return;
 	char line[64];
-	while(fgets(line, sizeof(line), f))
+	while(fgets(line, sizeof(line), f)) {
 		if(strncmp(line, "timestamp=", 10) == 0)
 			s_timestamp = atoi(line + 10) != 0;
+		else if(strncmp(line, "shutter=", 8) == 0)
+			s_shutter = (unsigned)clamp(atoi(line + 8), 0, SHUTTER_COUNT - 1);
+		else if(strncmp(line, "gain=", 5) == 0)
+			s_gain = (unsigned)clamp(atoi(line + 5), 0, 3);
+		else if(strncmp(line, "night_burst=", 12) == 0)
+			s_nightBurst = atoi(line + 12) != 0;
+		else if(strncmp(line, "rear_light=", 11) == 0)
+			s_rearLight = atoi(line + 11) != 0;
+	}
 	fclose(f);
 }
 
@@ -160,7 +186,8 @@ static void cfgSave(void) {
 	FILE *f = fopen(CFG_PATH, "w");
 	if(!f)
 		return;
-	fprintf(f, "timestamp=%d\n", s_timestamp ? 1 : 0);
+	fprintf(f, "timestamp=%d\nshutter=%u\ngain=%u\nnight_burst=%d\nrear_light=%d\n",
+		s_timestamp ? 1 : 0, s_shutter, s_gain, s_nightBurst ? 1 : 0, s_rearLight ? 1 : 0);
 	fclose(f);
 }
 
@@ -249,13 +276,46 @@ static int dayKey(time_t t) {
 #define JOB_PHOTO 0
 // (JOB_ values 1 and 2 are CHUNK_VIDEO / CHUNK_AUDIO)
 
+typedef struct PhotoMetadata {
+	time_t captured;
+	Camera camera;
+	unsigned lines, gain;
+	bool night, rearLight, watermark;
+} PhotoMetadata;
+
 typedef struct Job {
 	u32 type; // JOB_PHOTO / CHUNK_VIDEO / CHUNK_AUDIO
 	u32 aux;  // photo num / chunk index (frame or audio block number)
 	u32 slot; // ring/pool slot to return after writing (video/audio)
 	u32 size; // payload bytes (video/audio)
 	u16 *buf;
+	PhotoMetadata photo;
 } Job;
+
+static bool savePhotoMetadata(int num, const PhotoMetadata *photo) {
+	char path[40], shutter[20], gain[12];
+	metadataPath(path, num);
+	FILE *f = fopen(path, "w");
+	if(!f)
+		return false;
+	if(photo->lines) {
+		snprintf(shutter, sizeof(shutter), "%u lines", photo->lines);
+		snprintf(gain, sizeof(gain), "%ux", photo->gain);
+	} else {
+		strcpy(shutter, "auto");
+		strcpy(gain, "auto");
+	}
+	bool saved = fprintf(f,
+		"captured_unix=%ld\ncamera=%s\nshutter=%s\ngain_nominal=%s\n"
+		"night_burst=%d\nframes=%d\nrear_light_during_capture=%d\ntimestamp=%d\n",
+		(long)photo->captured, photo->camera == CAM_OUTER ? "outer" : "inner", shutter, gain,
+		photo->night, photo->night ? NIGHT_FRAMES : 1, photo->rearLight, photo->watermark) >= 0;
+	if(fclose(f) != 0)
+		saved = false;
+	if(!saved)
+		remove(path);
+	return saved;
+}
 
 #define JOB_QUEUE_LEN 32
 
@@ -333,20 +393,24 @@ static int workerMain(void *arg) {
 			rawPath(path, job->aux);
 			FILE *f = fopen(path, "wb");
 			char msg[32];
+			bool saved = false;
 			if(f) {
-				fwrite(job->buf, 1, RAW_SIZE, f);
-				fclose(f);
-				sprintf(msg, "SAVED IMG_%04d", (int)job->aux);
-			} else {
-				sprintf(msg, "SAVE FAILED: IMG_%04d", (int)job->aux);
+				saved = fwrite(job->buf, 1, RAW_SIZE, f) == RAW_SIZE;
+				if(fclose(f) != 0)
+					saved = false;
+				if(!saved)
+					remove(path);
 			}
+			bool metadataSaved = saved && savePhotoMetadata(job->aux, &job->photo);
+			snprintf(msg, sizeof(msg), !saved ? "SAVE FAILED: IMG_%04d" :
+				metadataSaved ? "SAVED IMG_%04d" : "SAVED IMG_%04d - NO METADATA", (int)job->aux);
 			uiStatus(msg);
 
 			// Thumbnail cache for the album grid.
 			u16 thumb[THUMB_W * THUMB_H];
 			blitYuvScaled(job->buf, thumb, THUMB_W, THUMB_W, THUMB_H);
 			thumbPath(path, job->aux);
-			f = fopen(path, "wb");
+			f = saved ? fopen(path, "wb") : NULL;
 			if(f) {
 				fwrite(thumb, 1, sizeof(thumb), f);
 				fclose(f);
@@ -384,41 +448,80 @@ static void drainJobs(void) {
 		swiWaitForVBlank();
 }
 
-// Captures one full-res frame and queues it for background saving. Blocks
-// only for the capture DMA itself (or for a queue slot if the SD card is
-// >JOB_QUEUE_LEN frames behind). `previewGfx` is the top-screen bitmap; the
-// frame is drawn to it so the preview updates during a burst.
+// Night source frames remain in RAM; only the completed photo is queued.
 static bool captureRaw(u16 *previewGfx) {
 	u16 *yuv = NULL;
 	Job *job = NULL;
+	if(s_nightBurst)
+		drainJobs();
 	for(;;) {
-		if(!yuv) // cache line aligned: the camera DMA writes around the cache
+		if(!yuv)
 			yuv = (u16 *)memalign(32, RAW_SIZE);
 		if(!job)
 			job = (Job *)malloc(sizeof(Job));
 		if(yuv && job)
 			break;
-		// Out of RAM: let the worker finish a frame and retry.
+		if(!JOBS_PENDING) {
+			free(yuv);
+			free(job);
+			uiStatus("NOT ENOUGH MEMORY");
+			return false;
+		}
 		swiWaitForVBlank();
 	}
 
-	// Bounded inside camera.c: a stalled camera fails the shot instead of
-	// hanging the app.
-	if(!cameraCapture(yuv, CAPTURE_MODE_CAPTURE)) {
-		free(yuv);
-		free(job);
-		return false;
-	}
-
-	// The sensor's first scanline carries garbage/embedded data (shows up as
-	// green speckles); paper over it with the second line.
+	time_t shotTime = time(NULL);
+	job->photo = (PhotoMetadata){
+		.captured = shotTime,
+		.camera = s_camera,
+		.lines = s_shutterLines[s_shutter],
+		.gain = s_shutter ? 1u << s_gain : 0,
+		.night = s_nightBurst,
+		.rearLight = s_camera == CAM_OUTER && s_rearLight && !s_nightBurst,
+		.watermark = s_timestamp,
+	};
+	NightStack *stack = NULL;
+	u16 *next = NULL;
+	const char *error = "CAMERA FAILED - TRY AGAIN";
+	if(s_nightBurst)
+		uiStatus("HOLD STILL  1/4  B: CANCEL");
+	if(!cameraCapture(yuv, CAPTURE_MODE_CAPTURE))
+		goto fail;
 	memcpy(yuv, yuv + 640, 640 * sizeof(u16));
 
-	// Stamped before the preview blit and the thumbnail, so what's shown
-	// matches what lands on the card.
+	if(s_nightBurst) {
+		next = (u16 *)memalign(32, RAW_SIZE);
+		stack = nightCreate((const u8 *)yuv);
+		if(!next || !stack) {
+			error = "NOT ENOUGH MEMORY";
+			goto fail;
+		}
+		for(int i = 1; i < NIGHT_FRAMES; i++) {
+			scanKeys();
+			if((keysDown() & KEY_B) || (keysHeld() & KEY_LID) || pmShouldReset()) {
+				error = "NIGHT BURST CANCELLED";
+				goto fail;
+			}
+			char msg[40];
+			sprintf(msg, "HOLD STILL  %d/4  B: CANCEL", i + 1);
+			uiStatus(msg);
+			if(!cameraCapture(next, CAPTURE_MODE_CAPTURE))
+				goto fail;
+			memcpy(next, next + 640, 640 * sizeof(u16));
+			nightAdd(stack, (const u8 *)next);
+		}
+		scanKeys();
+		if((keysDown() & KEY_B) || (keysHeld() & KEY_LID) || pmShouldReset()) {
+			error = "NIGHT BURST CANCELLED";
+			goto fail;
+		}
+		uiStatus("PROCESSING...");
+		nightFinish(stack, (u8 *)yuv);
+		nightFree(stack);
+		free(next);
+	}
 	if(s_timestamp)
-		watermarkYuv(yuv, time(NULL));
-
+		watermarkYuv(yuv, shotTime);
 	if(previewGfx)
 		blitYuv(yuv, previewGfx);
 
@@ -426,9 +529,37 @@ static bool captureRaw(u16 *previewGfx) {
 	job->aux  = s_nextRawNum++;
 	job->buf  = yuv;
 	while(!mailboxTrySend(&s_jobMailbox, (u32)job))
-		swiWaitForVBlank(); // queue full, wait for the worker
+		swiWaitForVBlank();
 	s_jobsQueued++;
 	return true;
+
+fail:
+	nightFree(stack);
+	free(next);
+	free(yuv);
+	free(job);
+	uiStatus(error);
+	return false;
+}
+
+static void takePhotos(u16 *gfx) {
+	streamStop();
+	if(s_nightBurst && !cameraSetRearLight(false)) {
+		cameraSetRearLight(s_rearLight);
+		uiStatus("REAR LIGHT OFF FAILED - NO PHOTO");
+		streamStart();
+		return;
+	}
+	pxiSendAndReceive(PXI_CAMERA, CAM_LED_ON);
+	do {
+		if(!captureRaw(gfx))
+			break;
+		scanKeys();
+	} while(!s_nightBurst && (keysHeld() & (KEY_L | KEY_R)) && !(keysHeld() & KEY_LID) && !pmShouldReset());
+	pxiSendAndReceive(PXI_CAMERA, CAM_LED_OFF);
+	if(s_nightBurst && !cameraSetRearLight(s_rearLight))
+		uiStatus("REAR LIGHT RESTORE FAILED");
+	streamStart();
 }
 
 // --- Video playback: audio streams through a looping ring while frames are
@@ -925,6 +1056,9 @@ static void softDelete(int num, bool isVideo) {
 		thumbPath(from, num);
 		sprintf(to, RAW_DIR "/trash/IMG_%04d.THM", num);
 		rename(from, to);
+		metadataPath(from, num);
+		sprintf(to, RAW_DIR "/trash/IMG_%04d.TXT", num);
+		rename(from, to);
 	}
 }
 
@@ -1012,6 +1146,10 @@ static const u8 *glyph(char c) {
 	if(c >= 'a' && c <= 'z')
 		c -= 'a' - 'A';
 	switch(c) {
+		case '+': {
+			static const u8 plus[5] = {0x08, 0x08, 0x3E, 0x08, 0x08};
+			return plus;
+		}
 		case '?':
 			return s_font[38];
 		case '.':
@@ -1190,18 +1328,190 @@ static void uiCameraScreen(int cam, bool fatInited) {
 	uiTextCenter(44, sub, UI_DIM);
 	uiSpace();
 
-	int y = 84;
+	int y = 78;
 	if(fatInited) {
-		uiKey(y, "L/R", s_videoMode ? "RECORD" : "TAKE PHOTOS");
-		uiKey(y += 16, "Y", s_videoMode ? "PHOTO MODE" : "VIDEO MODE");
-		uiKey(y += 16, "A", "SWAP CAMERA");
-		uiKey(y += 16, "SELECT", "ALBUM");
-		uiKey(y += 16, "X", s_timestamp ? "TIMESTAMP: ON" : "TIMESTAMP: OFF");
+		uiKey(y, "L/R", s_videoMode ? "RECORD" : s_nightBurst ? "NIGHT PHOTO" : "TAKE PHOTOS");
+		uiKey(y += 14, "Y", s_videoMode ? "PHOTO MODE" : "VIDEO MODE");
+		uiKey(y += 14, "A", "SWAP CAMERA");
+		uiKey(y += 14, "X", "ADVANCED");
+		uiKey(y += 14, "SELECT", "ALBUM");
 	} else {
 		uiTextCenter(y, "NO SD CARD - CANT SAVE", UI_FG);
-		uiKey(y += 16, "A", "SWAP CAMERA");
+		uiKey(y += 14, "A", "SWAP CAMERA");
 	}
-	uiKey(y += 16, "START", "EXIT");
+	uiKey(y += 14, "START", "EXIT");
+}
+
+#define UI_ACCENT (BIT(15) | RGB15(31, 25, 5))
+#define UI_PANEL (BIT(15) | RGB15(6, 6, 7))
+
+enum { ADV_SHUTTER, ADV_GAIN, ADV_NIGHT, ADV_REAR_LIGHT, ADV_TIMESTAMP, ADV_RESET, ADV_COUNT };
+#define ADV_ROW_Y 52
+#define ADV_ROW_H 17
+
+static bool advancedRowEnabled(int row) {
+	if(row == ADV_SHUTTER || row == ADV_NIGHT)
+		return !s_videoMode;
+	if(row == ADV_GAIN)
+		return !s_videoMode && s_shutter;
+	if(row == ADV_REAR_LIGHT)
+		return s_camera == CAM_OUTER;
+	return true;
+}
+
+static int advancedMoveSelection(int selected, int direction) {
+	do {
+		selected = (selected + direction + ADV_COUNT) % ADV_COUNT;
+	} while(!advancedRowEnabled(selected));
+	return selected;
+}
+
+static void uiAdvancedScreen(int selected) {
+	uiHeader("ADVANCED");
+	uiTextCenter(43, s_videoMode ? "VIDEO - PHOTO CONTROLS LOCKED" : "PHOTO", UI_DIM);
+	const char *labels[] = {"SHUTTER", "GAIN", "NIGHT BURST", "REAR LIGHT", "TIMESTAMP", "RESET"};
+	char shutter[16], gain[16];
+	if(!s_videoMode && s_shutter)
+		sprintf(shutter, "%u LINE%s", s_shutterLines[s_shutter], s_shutterLines[s_shutter] == 1 ? "" : "S");
+	else
+		strcpy(shutter, "AUTO");
+	if(!s_videoMode && s_shutter)
+		sprintf(gain, "%uX", 1u << s_gain);
+	else
+		strcpy(gain, "AUTO");
+	const char *values[] = {shutter, gain, !s_videoMode && s_nightBurst ? "ON" : "OFF",
+		s_camera == CAM_OUTER && s_rearLight ? "ON" : "OFF", s_timestamp ? "ON" : "OFF", ""};
+	for(int i = 0; i < ADV_COUNT; i++) {
+		int y = ADV_ROW_Y + i * ADV_ROW_H;
+		bool enabled = advancedRowEnabled(i);
+		bool active = enabled && i == selected;
+		uiRect(12, y, 232, ADV_ROW_H, active ? UI_PANEL : UI_BG);
+		if(active)
+			uiRect(12, y + 3, 2, 11, UI_ACCENT);
+		uiText(22, y + 5, labels[i], !enabled ? UI_DIM : active ? UI_ACCENT : UI_FG);
+		uiText(222 - strlen(values[i]) * 6, y + 5, values[i], enabled ? UI_FG : UI_DIM);
+		if(enabled && i != ADV_RESET) {
+			uiText(138, y + 5, "<", UI_DIM);
+			uiText(234, y + 5, ">", UI_DIM);
+		}
+	}
+	uiTextCenter(159, "UP/DOWN SELECT  < > ADJUST", UI_DIM);
+	uiTextCenter(171, s_videoMode ? "A: SET   B/X: DONE" : "A: SET  L/R: PHOTO  B/X: DONE", UI_DIM);
+	const char *hints[] = {"A: AUTO - MANUAL UNLOCKS GAIN", "HIGHER GAIN ADDS NOISE",
+		"4 FRAMES - REAR LIGHT OFF", "OFF WHILE NIGHT BURST SHOOTS",
+		"BURN DATE AND TIME INTO IMAGE", "A: RESET ALL SETTINGS"};
+	uiStatus(hints[selected]);
+}
+
+static void uiExposureFailure(unsigned lines, unsigned gain) {
+	unsigned stage = cameraExposureError(EXPOSURE_ERROR_STAGE);
+	unsigned reg = cameraExposureError(EXPOSURE_ERROR_REGISTER);
+	char message[40];
+	snprintf(message, sizeof(message), "SENSOR E%u R%04X - TRY AUTO", stage, reg);
+	uiStatus(message);
+	FILE *f = fopen(RAW_DIR "/exposure-errors.log", "a");
+	if(!f)
+		return;
+	fprintf(f, "time=%ld camera=%d lines=%u gain=%u stage=%u reg=%04X expected=%04X observed=%04X\n",
+		(long)time(NULL), s_camera, lines, gain, stage, reg,
+		cameraExposureError(EXPOSURE_ERROR_EXPECTED), cameraExposureError(EXPOSURE_ERROR_OBSERVED));
+	fclose(f);
+}
+
+static void advancedMenu(u16 *gfx) {
+	int selected = s_videoMode ? ADV_TIMESTAMP : ADV_SHUTTER;
+	keysSetRepeat(18, 6);
+	uiAdvancedScreen(selected);
+	while(!pmShouldReset()) {
+		swiWaitForVBlank();
+		scanKeys();
+		if(keysHeld() & KEY_LID) {
+			lidSleep();
+			continue;
+		}
+		u16 *frame = cameraNextFrame();
+		if(frame)
+			memcpy(gfx, frame, VID_FRAME_SIZE);
+		u16 pressed = keysDownRepeat();
+		bool tappedAction = false;
+		if(keysDown() & KEY_TOUCH) {
+			touchPosition touch;
+			touchRead(&touch);
+			if(touch.py >= ADV_ROW_Y && touch.py < ADV_ROW_Y + ADV_COUNT * ADV_ROW_H) {
+				int row = (touch.py - ADV_ROW_Y) / ADV_ROW_H;
+				if(!advancedRowEnabled(row))
+					continue;
+				selected = row;
+				if(touch.px >= 128) {
+					if(selected == ADV_RESET)
+						tappedAction = true;
+					else
+						pressed |= touch.px < 180 ? KEY_LEFT : KEY_RIGHT;
+				}
+			}
+		}
+		if(keysDown() & (KEY_B | KEY_X | KEY_START))
+			break;
+		if(!s_videoMode && (keysDown() & (KEY_L | KEY_R))) {
+			takePhotos(gfx);
+			continue;
+		}
+		if(!pressed)
+			continue;
+		unsigned oldShutter = s_shutter, oldGain = s_gain;
+		bool oldNight = s_nightBurst, oldTimestamp = s_timestamp, oldRearLight = s_rearLight;
+		if(pressed & KEY_UP)
+			selected = advancedMoveSelection(selected, -1);
+		else if(pressed & KEY_DOWN)
+			selected = advancedMoveSelection(selected, 1);
+		int direction = (pressed & KEY_LEFT) ? -1 : (pressed & KEY_RIGHT) ? 1 : 0;
+		bool action = tappedAction || (keysDown() & KEY_A);
+		if(selected == ADV_SHUTTER) {
+			if(direction)
+				s_shutter = clamp((int)s_shutter + direction, 0, SHUTTER_COUNT - 1);
+			if(action)
+				s_shutter = 0;
+		} else if(selected == ADV_GAIN) {
+			if(action)
+				s_gain = (s_gain + 1) % 4;
+			else if(direction)
+				s_gain = clamp((int)s_gain + direction, 0, 3);
+		} else if(selected == ADV_NIGHT && (action || direction)) {
+			s_nightBurst = direction ? direction > 0 : !s_nightBurst;
+		} else if(selected == ADV_TIMESTAMP && (action || direction)) {
+			s_timestamp = direction ? direction > 0 : !s_timestamp;
+		} else if(selected == ADV_REAR_LIGHT && (action || direction)) {
+			s_rearLight = direction ? direction > 0 : !s_rearLight;
+		} else if(selected == ADV_RESET && action) {
+			s_shutter = s_gain = 0;
+			s_nightBurst = false;
+			s_timestamp = false;
+			s_rearLight = true;
+		}
+		bool changed = !s_videoMode && (oldShutter != s_shutter || oldGain != s_gain);
+		unsigned attemptedLines = s_shutterLines[s_shutter], attemptedGain = s_gain;
+		if(changed)
+			uiStatus("APPLYING SENSOR SETTINGS...");
+		bool ok = !changed || cameraSetExposure(attemptedLines, attemptedGain);
+		if(!ok) {
+			s_shutter = oldShutter;
+			s_gain = oldGain;
+			s_nightBurst = oldNight;
+			s_timestamp = oldTimestamp;
+			s_rearLight = oldRearLight;
+		}
+		bool lightOk = oldRearLight == s_rearLight || cameraSetRearLight(s_rearLight);
+		if(!lightOk) {
+			s_rearLight = oldRearLight;
+			cameraSetRearLight(s_rearLight);
+		}
+		uiAdvancedScreen(selected);
+		if(!ok)
+			uiExposureFailure(attemptedLines, attemptedGain);
+		else if(!lightOk)
+			uiStatus("REAR LIGHT SETTING FAILED");
+	}
+	cfgSave();
 }
 
 // Centered modal question; waits for A (true) / B (false).
@@ -1701,6 +2011,7 @@ int main(int argc, char **argv) {
 	uiStatus("INITIALIZING...");
 	pxiWaitRemote(PXI_CAMERA); // Wait for ARM7 to initialize PXI
 	cameraInit();
+	bool lightReady = cameraSetRearLight(s_rearLight);
 	soundInit(); // ARM9 interface to the ARM7 sound driver (video playback)
 	soundPowerOn();
 	soundSetMixerConfig(SoundOutSrc_Mixer, SoundOutSrc_Mixer, false, false);
@@ -1722,9 +2033,15 @@ int main(int argc, char **argv) {
 	Camera camera = CAM_OUTER;
 	s_camera      = camera;
 	cameraActivate(camera);
+	if(!cameraSetExposure(s_shutterLines[s_shutter], s_gain)) {
+		s_shutter = s_gain = 0;
+		cameraSetExposure(0, 0);
+	}
 	streamStart(); // continuous viewfinder
 
 	uiCameraScreen(camera, fatInited);
+	if(!lightReady)
+		uiStatus("REAR LIGHT SETTING FAILED");
 
 	while(1) {
 		u16 pressed = 0;
@@ -1740,7 +2057,6 @@ int main(int argc, char **argv) {
 			scanKeys();
 			// Lid closed: shut the camera off and sleep until it reopens.
 			if(keysHeld() & KEY_LID) {
-				drainJobs(); // don't sleep with writes half-finished
 				lidSleep();
 				continue;
 			}
@@ -1760,13 +2076,17 @@ int main(int argc, char **argv) {
 
 			uiCameraScreen(camera, fatInited);
 		} else if(fatInited && pressed & KEY_Y) {
-			s_videoMode = !s_videoMode;
+			bool video = !s_videoMode;
+			if(!cameraSetExposure(video ? 0 : s_shutterLines[s_shutter], s_gain)) {
+				uiExposureFailure(video ? 0 : s_shutterLines[s_shutter], s_gain);
+				continue;
+			}
+			s_videoMode = video;
 			uiCameraScreen(camera, fatInited);
 		} else if(fatInited && pressed & KEY_X) {
-			s_timestamp = !s_timestamp;
-			cfgSave();
+			drainJobs();
+			advancedMenu(gfx);
 			uiCameraScreen(camera, fatInited);
-			uiStatus(s_timestamp ? "TIMESTAMP ON" : "TIMESTAMP OFF");
 		} else if(fatInited && pressed & (KEY_L | KEY_R)) {
 			if(s_videoMode) {
 				// Tap L/R to record, tap again to stop.
@@ -1778,17 +2098,7 @@ int main(int argc, char **argv) {
 				if(s_savedMsg[0])
 					uiStatus(s_savedMsg); // survives the redraw above
 			} else {
-				// Hold L/R to keep taking photos continuously. Camera LED
-				// lights while shooting, like a shutter indicator.
-				streamStop(); // photos reconfigure the sensor for 640x480
-				pxiSendAndReceive(PXI_CAMERA, CAM_LED_ON);
-				do {
-					captureRaw(gfx);
-					scanKeys();
-					// Don't keep shooting into a closed lid (e.g. in a pocket).
-				} while((keysHeld() & (KEY_L | KEY_R)) && !(keysHeld() & KEY_LID));
-				pxiSendAndReceive(PXI_CAMERA, CAM_LED_OFF);
-				streamStart();
+				takePhotos(gfx);
 				uiSpace(); // refresh the free-space line after the burst
 			}
 		} else if(fatInited && pressed & KEY_SELECT) {
