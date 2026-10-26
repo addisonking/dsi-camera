@@ -13,6 +13,7 @@ static unsigned coreDelay[2], contextDelay[2], waits;
 static u16 nextState[2];
 static int failReg = -1, ignoreReg = -1, failMcu = -1;
 static bool overrideExposure, stuckContext, liveAe, deferredCore, inFlightAwb;
+static bool failRelease;
 static const u16 coreRegs[] = {0x3012, 0x3014, 0x302A, 0x302C, 0x302E, 0x3030};
 static const u16 baseline[] = {120, 246, 32, 36, 40, 32};
 static const u16 autoRegs[] = {0xA117,
@@ -39,6 +40,8 @@ static int cameraIndex(void) { return currentDevice == I2C_CAM0 ? 0 : 1; }
 u8 aptWriteRegister(u8 device, u16 reg, u16 value) {
 	int cam = device == I2C_CAM0 ? 0 : 1;
 	if(reg == failReg)
+		return 0;
+	if(reg == 0x3022 && !(value & 0x0100) && failRelease)
 		return 0;
 	if(reg == ignoreReg)
 		return 1;
@@ -225,6 +228,19 @@ int main(void) {
 	overrideExposure = true;
 	assert(!setExposure(4, 0));
 	overrideExposure = false;
+	assert(setExposure(0, 0));
+	restored(0);
+
+	setup(0);
+	failRelease = true;
+	assert(!setExposure(64, 2));
+	assert(core[0][0x3022] & 0x0100);
+	assert(!setExposure(0, 0));
+	failRelease = false;
+	assert(setExposure(0, 0));
+	restored(0);
+	assert(setExposure(64, 2));
+	assert(core[0][0x3012] == 64);
 	assert(setExposure(0, 0));
 	restored(0);
 

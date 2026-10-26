@@ -43,7 +43,7 @@ bool cameraSetRearLight(bool enabled);
 bool cameraCapture(u16 *dst, CaptureMode mode);
 
 // Real sensor integration in rows (0 = auto), analogue gain 1x/2x/4x/8x.
-// Applied again after mode changes; false means register verification failed.
+// Applied again after mode changes; false means sensor or preview setup failed.
 bool cameraSetExposure(unsigned lines, unsigned gain);
 unsigned cameraExposureError(ExposureErrorField field);
 
@@ -56,9 +56,11 @@ bool cameraStreamStart(void);
 // Stops continuous capture (safe to call when not streaming).
 void cameraStreamStop(void);
 
-// True while the continuous stream is armed. Single source of truth for
-// whether the viewfinder should be producing frames.
+// True while the continuous stream is armed.
 bool cameraStreamRunning(void);
+
+// Includes a failed start that the preview watchdog will retry.
+bool cameraStreamRequested(void);
 
 // Returns the newest completed frame, or NULL if no new frame arrived since the
 // last call. The pointer is one of three buffers the camera rotates through, so

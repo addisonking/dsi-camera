@@ -65,10 +65,18 @@ int main(void) {
 	ignoreWrite = true;
 	assert(!setRearLight(false) && light == 1);
 	ignoreWrite = false;
+	// The caller rolls a rejected toggle back to its previous preference.
+	assert(setRearLight(true));
 	deactivate(I2C_CAM1);
 	activate(I2C_CAM1);
 	assert(light == 1);
 	assert(setRearLight(false) && !light);
+	failWrite = true;
+	assert(!setRearLight(true) && !light);
+	failWrite = false;
+	deactivate(I2C_CAM1);
+	activate(I2C_CAM1);
+	assert(light == 1);
 	deactivate(I2C_CAM1);
 	assert(!light);
 	puts("rear light: verified writes, inner/outer switching, sleep persistence, failed/ignored writes passed");

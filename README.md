@@ -59,7 +59,7 @@ clean.
 
 Press **X**. Use up/down to select a row and left/right to adjust,
 or tap the arrows beside a value. Press **A** on Shutter to return to Auto,
-on Gain, Night Burst, or Timestamp to cycle/toggle, or on Reset to restore all
+on Gain, Night Burst, Rear Light, or Timestamp to cycle/toggle, or on Reset to restore all
 settings. Press **B** or **X** to return to the viewfinder. The top screen stays
 live while adjusting. Gain is gray and cannot be selected until Shutter is manual.
 In photo mode, L/R takes photos directly from Advanced without closing it;
@@ -108,7 +108,7 @@ Sensor writes are grouped and integration/gain are read back at sensor frame
 boundaries before use. Context changes wait for final preview/capture entry
 before reapplying the controls. Failures keep the previous selection, show a
 stage/register code, and append expected/observed values to
-`/photos/exposure-errors.log` before rollback. Exact
+`/photos/exposure-errors.log`. Exact
 shutter times and actual sensor behavior still need validation on a physical DSi;
 no diagnostic or probe app is included. Register definitions follow
 [GBATEK's Aptina register research](https://mgba-emu.github.io/gbatek/#dsi-aptina-camera-registers-core-3000h-31ffh-38xxh).

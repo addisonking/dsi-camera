@@ -7,10 +7,10 @@ static bool s_cameraActive;
 static bool s_rearLight = true;
 
 bool setRearLight(bool enabled) {
-	u8 value = enabled && s_cameraActive && currentDevice == I2C_CAM1;
+	s_rearLight = enabled;
+	u8 value    = enabled && s_cameraActive && currentDevice == I2C_CAM1;
 	if(!i2cWriteRegister(I2C_PM, I2CREGPM_CAMLED, value) || (i2cReadRegister(I2C_PM, I2CREGPM_CAMLED) & 3) != value)
 		return false;
-	s_rearLight = enabled;
 	return true;
 }
 
@@ -256,8 +256,16 @@ static bool exposureFreeze(int cam) {
 
 static bool exposureWriteCore(const u16 *values) {
 	u16 hold = aptReadRegister(currentDevice, 0x3022);
-	if(hold == 0xFFFF || (hold & 0x0100))
+	if(hold == 0xFFFF)
 		return exposureFail(1, 0x3022, 0, hold);
+	if(hold & 0x0100) {
+		hold &= ~0x0100;
+		bool released = false;
+		for(int i = 0; i < 3 && !released; i++)
+			released = aptWriteRegister(currentDevice, 0x3022, hold) && aptReadRegister(currentDevice, 0x3022) == hold;
+		if(!released)
+			return exposureFail(2, 0x3022, hold, aptReadRegister(currentDevice, 0x3022));
+	}
 	bool written = aptWriteRegister(currentDevice, 0x3022, hold | 0x0100) &&
 		aptReadRegister(currentDevice, 0x3022) == (hold | 0x0100);
 	if(!written)
