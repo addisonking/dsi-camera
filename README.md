@@ -31,6 +31,9 @@ Requires [devkitPro](https://devkitpro.org) with devkitARM, libnds, and calico.
 make
 ```
 
+The host-side photo index tests can be run without devkitPro using
+`./tools/pit/test.sh` (requires a C compiler).
+
 Copy `dsi-camera.nds` to your SD card and launch it (tested with Unlaunch).
 Photos and videos are saved to `sd:/photos/`; drop `tools/convert.sh` in that
 folder and run it on a PC to get PNGs and MP4s. Options (currently just the
