@@ -1,17 +1,33 @@
 #!/bin/sh
 # Sits in the photos directory; converts every new IMG_*.YUV (640x480 packed
 # YUV422) to png/ and every new VID_*.VID (dsi-camera video container) to
-# vid/ as mp4. Already-converted files are skipped on the next run.
+# vid/ as mp4. Output files inherit the source capture timestamp.
+# Already-converted files are skipped on the next run.
 set -e
 cd "$(dirname "$0")"
+
+preserve_timestamp() {
+	src=$1
+	dst=$2
+	touch -r "$src" "$dst"
+	if command -v SetFile >/dev/null 2>&1; then
+		stamp=$(stat -f '%Sm' -t '%m/%d/%Y %H:%M:%S' "$src")
+		SetFile -d "$stamp" -m "$stamp" "$dst"
+	fi
+}
 
 mkdir -p png
 new=0
 for f in IMG_*.YUV; do
 	[ -f "$f" ] || continue
+	[ -s "$f" ] || {
+		echo "$f: empty, skipping"
+		continue
+	}
 	png="png/${f%.*}.png"
 	[ -f "$png" ] && continue
 	ffmpeg -loglevel error -n -f rawvideo -pix_fmt yuyv422 -s 640x480 -i "$f" "$png"
+	preserve_timestamp "$f" "$png"
 	echo "$f -> $png"
 	new=$((new + 1))
 done
@@ -21,12 +37,17 @@ mkdir -p vid
 new=0
 for f in VID_*.VID; do
 	[ -f "$f" ] || continue
+	[ -s "$f" ] || {
+		echo "$f: empty, skipping"
+		continue
+	}
 	mp4="vid/${f%.*}.mp4"
 	[ -f "$mp4" ] && continue
 	if python3 - "$f" "$mp4" <<'EOF'
-import math, struct, subprocess, sys, os, tempfile
+import datetime, math, struct, subprocess, sys, os, tempfile
 
 src, dst = sys.argv[1], sys.argv[2]
+st = os.stat(src)
 d = open(src, 'rb').read()
 MAGICS = (b'DSIVID01', b'DSIVID02')
 if len(d) < 40 or d[:8] not in MAGICS:
@@ -91,13 +112,18 @@ with tempfile.TemporaryDirectory() as tmp:
         a = os.path.join(tmp, 'a.pcm')
         open(a, 'wb').write(pcm)
         cmd += ['-f', 's16le', '-ar', str(rate), '-ac', '1', '-i', a]
-    cmd += ['-c:v', 'libx264', '-pix_fmt', 'yuv420p']
+    cmd += [
+        '-metadata', 'creation_time=' + datetime.datetime.fromtimestamp(
+            st.st_mtime, datetime.timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z'),
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+    ]
     if pcm:
         cmd += ['-c:a', 'aac']
     cmd.append(dst)
     subprocess.run(cmd, check=True)
 EOF
 	then
+		[ ! -f "$mp4" ] || preserve_timestamp "$f" "$mp4"
 		echo "$f -> $mp4"
 		new=$((new + 1))
 	fi
