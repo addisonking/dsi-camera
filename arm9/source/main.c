@@ -1,6 +1,7 @@
 #include "camera.h"
 #include "night.h"
 #include "version.h"
+#include "white_balance.h"
 
 #include <calico/arm/cache.h>
 #include <calico/nds/pm.h>
@@ -44,6 +45,7 @@ static const unsigned s_shutterLines[] = {0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 5
 #define SHUTTER_COUNT (sizeof(s_shutterLines) / sizeof(s_shutterLines[0]))
 static unsigned s_shutter;
 static unsigned s_gain;
+static int s_warmth;
 static bool s_nightBurst;
 static bool s_rearLight = true;
 static bool s_timestamp;    // burn the capture time into saved pixels
@@ -176,6 +178,8 @@ static void cfgLoad(void) {
 			s_shutter = (unsigned)clamp(atoi(line + 8), 0, SHUTTER_COUNT - 1);
 		else if(strncmp(line, "gain=", 5) == 0)
 			s_gain = (unsigned)clamp(atoi(line + 5), 0, 3);
+		else if(strncmp(line, "warmth=", 7) == 0)
+			s_warmth = clamp(atoi(line + 7), -3, 3);
 		else if(strncmp(line, "night_burst=", 12) == 0)
 			s_nightBurst = atoi(line + 12) != 0;
 		else if(strncmp(line, "rear_light=", 11) == 0)
@@ -189,10 +193,11 @@ static void cfgSave(void) {
 	if(!f)
 		return;
 	fprintf(f,
-			"timestamp=%d\nshutter=%u\ngain=%u\nnight_burst=%d\nrear_light=%d\n",
+			"timestamp=%d\nshutter=%u\ngain=%u\nwarmth=%d\nnight_burst=%d\nrear_light=%d\n",
 			s_timestamp ? 1 : 0,
 			s_shutter,
 			s_gain,
+			s_warmth,
 			s_nightBurst ? 1 : 0,
 			s_rearLight ? 1 : 0);
 	fclose(f);
@@ -483,6 +488,7 @@ static bool captureRaw(u16 *previewGfx) {
 		nightFree(stack);
 		free(next);
 	}
+	whiteBalanceYuv((u8 *)yuv, 640 * 480, s_warmth);
 	if(s_timestamp)
 		watermarkYuv(yuv, shotTime);
 	if(previewGfx)
@@ -1305,12 +1311,12 @@ static void uiCameraScreen(int cam, bool fatInited) {
 #define UI_ACCENT (BIT(15) | RGB15(31, 25, 5))
 #define UI_PANEL (BIT(15) | RGB15(6, 6, 7))
 
-enum { ADV_SHUTTER, ADV_GAIN, ADV_NIGHT, ADV_REAR_LIGHT, ADV_TIMESTAMP, ADV_RESET, ADV_COUNT };
+enum { ADV_SHUTTER, ADV_GAIN, ADV_WHITE_BALANCE, ADV_NIGHT, ADV_REAR_LIGHT, ADV_TIMESTAMP, ADV_RESET, ADV_COUNT };
 #define ADV_ROW_Y 52
-#define ADV_ROW_H 17
+#define ADV_ROW_H 14
 
 static bool advancedRowEnabled(int row) {
-	if(row == ADV_SHUTTER || row == ADV_NIGHT)
+	if(row == ADV_SHUTTER || row == ADV_WHITE_BALANCE || row == ADV_NIGHT)
 		return !s_videoMode;
 	if(row == ADV_GAIN)
 		return !s_videoMode && s_shutter;
@@ -1329,8 +1335,12 @@ static int advancedMoveSelection(int selected, int direction) {
 static void uiAdvancedScreen(int selected) {
 	uiHeader("ADVANCED");
 	uiTextCenter(43, s_videoMode ? "VIDEO - PHOTO CONTROLS LOCKED" : "PHOTO", UI_DIM);
-	const char *labels[] = {"SHUTTER", "GAIN", "NIGHT BURST", "REAR LIGHT", "TIMESTAMP", "RESET"};
-	char shutter[16], gain[16];
+	const char *labels[] = {"SHUTTER", "GAIN", "WHITE BALANCE", "NIGHT BURST", "REAR LIGHT", "TIMESTAMP", "RESET"};
+	char shutter[16], gain[16], warmth[16];
+	if(!s_warmth || s_videoMode)
+		strcpy(warmth, "AUTO");
+	else
+		sprintf(warmth, "%s %d", s_warmth > 0 ? "WARM" : "COOL", abs(s_warmth));
 	if(!s_videoMode && s_shutter)
 		sprintf(shutter, "%u LINE%s", s_shutterLines[s_shutter], s_shutterLines[s_shutter] == 1 ? "" : "S");
 	else
@@ -1341,6 +1351,7 @@ static void uiAdvancedScreen(int selected) {
 		strcpy(gain, "AUTO");
 	const char *values[] = {shutter,
 							gain,
+							warmth,
 							!s_videoMode && s_nightBurst ? "ON" : "OFF",
 							s_camera == CAM_OUTER && s_rearLight ? "ON" : "OFF",
 							s_timestamp ? "ON" : "OFF",
@@ -1363,6 +1374,7 @@ static void uiAdvancedScreen(int selected) {
 	uiTextCenter(171, s_videoMode ? "A: SET   B/X: DONE" : "A: SET  L/R: PHOTO  B/X: DONE", UI_DIM);
 	const char *hints[] = {"A: AUTO - MANUAL UNLOCKS GAIN",
 						   "HIGHER GAIN ADDS NOISE",
+						   "A: AUTO  < COOL / WARM >",
 						   "4 FRAMES - REAR LIGHT OFF",
 						   "OFF WHILE NIGHT BURST SHOOTS",
 						   "BURN DATE AND TIME INTO IMAGE",
@@ -1408,8 +1420,12 @@ static bool advancedMenu(u16 *gfx) {
 			continue;
 		}
 		u16 *frame = cameraNextFrame();
-		if(frame)
-			memcpy(gfx, frame, VID_FRAME_SIZE);
+		if(frame) {
+			if(!s_videoMode && s_warmth)
+				whiteBalancePreview(frame, gfx, VID_W * VID_H, s_warmth);
+			else
+				memcpy(gfx, frame, VID_FRAME_SIZE);
+		}
 		u16 pressed       = keysDownRepeat();
 		bool tappedAction = false;
 		if(keysDown() & KEY_TOUCH) {
@@ -1439,6 +1455,7 @@ static bool advancedMenu(u16 *gfx) {
 		if(!pressed)
 			continue;
 		unsigned oldShutter = s_shutter, oldGain = s_gain;
+		int oldWarmth = s_warmth;
 		bool oldNight = s_nightBurst, oldTimestamp = s_timestamp, oldRearLight = s_rearLight;
 		if(pressed & KEY_UP)
 			selected = advancedMoveSelection(selected, -1);
@@ -1456,6 +1473,11 @@ static bool advancedMenu(u16 *gfx) {
 				s_gain = (s_gain + 1) % 4;
 			else if(direction)
 				s_gain = clamp((int)s_gain + direction, 0, 3);
+		} else if(selected == ADV_WHITE_BALANCE) {
+			if(action)
+				s_warmth = 0;
+			else if(direction)
+				s_warmth = clamp(s_warmth + direction, -3, 3);
 		} else if(selected == ADV_NIGHT && (action || direction)) {
 			s_nightBurst = direction ? direction > 0 : !s_nightBurst;
 		} else if(selected == ADV_TIMESTAMP && (action || direction)) {
@@ -1464,6 +1486,7 @@ static bool advancedMenu(u16 *gfx) {
 			s_rearLight = direction ? direction > 0 : !s_rearLight;
 		} else if(selected == ADV_RESET && action) {
 			s_shutter = s_gain = 0;
+			s_warmth           = 0;
 			s_nightBurst       = false;
 			s_timestamp        = false;
 			s_rearLight        = true;
@@ -1476,6 +1499,7 @@ static bool advancedMenu(u16 *gfx) {
 		if(!ok) {
 			s_shutter    = oldShutter;
 			s_gain       = oldGain;
+			s_warmth     = oldWarmth;
 			s_nightBurst = oldNight;
 			s_timestamp  = oldTimestamp;
 			s_rearLight  = oldRearLight;
@@ -2045,8 +2069,12 @@ int main(int argc, char **argv) {
 			}
 			// Blit whatever the camera has produced since the last vblank.
 			u16 *frame = cameraNextFrame();
-			if(frame)
-				memcpy(gfx, frame, VID_FRAME_SIZE);
+			if(frame) {
+				if(!s_videoMode && s_warmth)
+					whiteBalancePreview(frame, gfx, VID_W * VID_H, s_warmth);
+				else
+					memcpy(gfx, frame, VID_FRAME_SIZE);
+			}
 			pressed = keysDown();
 		} while(!pressed);
 

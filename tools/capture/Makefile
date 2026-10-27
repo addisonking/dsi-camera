@@ -13,3 +13,6 @@ test:
 	/tmp/dsi-camera-exposure-test
 	$(CC) $(CFLAGS) -Wno-unused-parameter -Ishim -I$(ROOT)/arm7/include -I$(ROOT)/shared/include $(ROOT)/arm7/source/aptina.c rear_light_test.c -o /tmp/dsi-camera-rear-light-test
 	/tmp/dsi-camera-rear-light-test
+
+	$(CC) $(CFLAGS) -I$(ROOT)/arm9/include $(ROOT)/arm9/source/white_balance.c white_balance_test.c -o /tmp/dsi-camera-white-balance-test
+	/tmp/dsi-camera-white-balance-test

@@ -5,7 +5,7 @@ A homebrew camera app for the Nintendo DSi. Fork of [Pk11's dsi-camera](https://
 ## Features
 
 - Photos: raw 640x480 YUV from either camera, burst capture while held
-- Advanced photo controls: real sensor integration (shutter) and analogue gain
+- Advanced photo controls: real sensor integration (shutter), analogue gain, and white balance
 - Night burst: four full-resolution frames aligned and merged on the DSi into one photo
 - Rear camera light toggle; always off during Night Burst captures
 - Video: 256x192 with microphone audio at up to 10fps, recorded to a simple chunked container
@@ -58,7 +58,7 @@ clean.
 ## Advanced controls
 
 Press **X**. Use up/down to select a row and left/right to adjust,
-or tap the arrows beside a value. Press **A** on Shutter to return to Auto,
+or tap the arrows beside a value. Press **A** on Shutter or White Balance to return to Auto,
 on Gain, Night Burst, Rear Light, or Timestamp to cycle/toggle, or on Reset to restore all
 settings. Press **B** or **X** to return to the viewfinder. The top screen stays
 live while adjusting. Gain is gray and cannot be selected until Shutter is manual.
@@ -80,6 +80,10 @@ Rear Light is available whenever the outer camera is selected.
   locked during manual exposure. Sensor gain limits and quantization can limit
   the selected gain. Auto restores the original core registers, automatic
   exposure, gain, and white balance. This is not an ISO scale.
+- **White Balance:** Auto, or three cooler and three warmer steps. This adjusts
+  photo color on the DSi relative to the sensor's current white balance; it is
+  not a calibrated color temperature or a sensor setting. The live preview is
+  an approximation of the saved result.
 - **Night Burst:** one shutter press captures four frames and saves one merged
   photo. Hold still; press B to cancel. Alignment compensates for small camera
   shifts, and changed pixels are rejected to limit ghosting. If alignment fails,
@@ -99,7 +103,7 @@ integration until the bright surface has detail. Night Burst can reduce noise
 at that same exposure. The DSi's fixed wide-angle lens still limits lunar detail.
 There is no digital exposure/brightness adjustment in this pipeline.
 
-Shutter, Gain, and Night Burst apply only to photos. Video restores each sensor's automatic
+Shutter, Gain, White Balance, and Night Burst apply only to photos. Video restores each sensor's automatic
 exposure settings; returning to photo mode reapplies the saved photo controls.
 New settings default to Auto / 1x / Night Burst Off. Existing settings files
 remain compatible.
