@@ -53,6 +53,8 @@ jobs:
   publish_build:
     runs-on: ubuntu-latest
     name: Upload to release
+    permissions:
+      contents: write
     if: ${{ success() && startsWith(github.ref, 'refs/tags') }}
     needs: [build, test]
     steps:
@@ -72,5 +74,5 @@ jobs:
             CONTENT_TYPE="Content-Type: application/7z-x-compressed"
             UPLOAD_URL="https://uploads.github.com/repos/${{ github.repository }}/releases/$ID/assets?name=$(basename $file)"
 
-            curl -XPOST -H "$AUTH_HEADER" -H "$CONTENT_LENGTH" -H "$CONTENT_TYPE" --upload-file "$file" "$UPLOAD_URL"
+            curl --fail-with-body -XPOST -H "$AUTH_HEADER" -H "$CONTENT_LENGTH" -H "$CONTENT_TYPE" --upload-file "$file" "$UPLOAD_URL"
           done
