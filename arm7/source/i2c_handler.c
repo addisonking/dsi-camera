@@ -3,10 +3,9 @@
 #include "aptina.h"
 #include "aptina_i2c.h"
 
-#include <nds.h>
-
 #include <calico/nds/arm7/i2c.h>
 #include <calico/nds/arm7/mcu.h>
+#include <nds.h>
 
 // Management structure and stack space for PXI server thread
 Thread s_i2cPxiThread;
@@ -28,10 +27,9 @@ static void micexStart(void) {
 	REG_MICEX_CNT = MICEX_CNT_NO_R | MICEX_CNT_RATE_DIV(1) | MICEX_CNT_ENABLE; // div1 = 16364Hz
 }
 
-#define MIC_NDMA_CFG                                                                               \
-	(NDMA_DST_MODE(NdmaMode_Increment) | NDMA_SRC_MODE(NdmaMode_Fixed) | NDMA_BLK_WORDS(8) |       \
-	 NDMA_TIMING(NdmaTiming_MicData) | NDMA_TX_MODE(NdmaTxMode_Timing) | NDMA_IRQ_ENABLE |         \
-	 NDMA_START)
+#define MIC_NDMA_CFG \
+	(NDMA_DST_MODE(NdmaMode_Increment) | NDMA_SRC_MODE(NdmaMode_Fixed) | NDMA_BLK_WORDS(8) | \
+	 NDMA_TIMING(NdmaTiming_MicData) | NDMA_TX_MODE(NdmaTxMode_Timing) | NDMA_IRQ_ENABLE | NDMA_START)
 
 // Fully (re)initializes NDMA channel ch to capture one mic buffer into `slot`.
 // A wedged channel can't be revived with just |= NDMA_START, so always rebuild
@@ -91,8 +89,8 @@ static void micWatchdogTick(TickTask *t) {
 }
 
 static void micStart(void) {
-	s_micDone   = (vu32 *)s_micAddr;
-	*s_micDone  = 0;
+	s_micDone  = (vu32 *)s_micAddr;
+	*s_micDone = 0;
 	for(int i = 1; i < 6; i++)
 		((vu32 *)s_micAddr)[i] = 0; // reset debug telemetry
 	s_micActive = true;
@@ -128,6 +126,11 @@ int i2cPxiThreadMain(void *arg) {
 		// Receive a message
 		u32 msg    = mailboxRecv(&mb);
 		u32 retval = 0;
+		if(msg & CAM_EXPOSURE_REQUEST) {
+			retval = setExposure(msg & CAM_EXPOSURE_LINES_MASK, (msg >> CAM_EXPOSURE_GAIN_SHIFT) & 3);
+			pxiReply(PxiChannel_User0, retval);
+			continue;
+		}
 
 		switch(msg) {
 			case CAM_INIT:
@@ -152,12 +155,16 @@ int i2cPxiThreadMain(void *arg) {
 				retval = CAM1_DEACTIVATE;
 				break;
 			case CAM_SET_MODE_PREVIEW:
-				setMode(CAPTURE_MODE_PREVIEW);
-				retval = CAPTURE_MODE_PREVIEW;
+				retval = setMode(CAPTURE_MODE_PREVIEW) ? CAPTURE_MODE_PREVIEW : 0;
 				break;
 			case CAM_SET_MODE_CAPTURE:
-				setMode(CAPTURE_MODE_CAPTURE);
-				retval = CAPTURE_MODE_CAPTURE;
+				retval = setMode(CAPTURE_MODE_CAPTURE) ? CAPTURE_MODE_CAPTURE : 0;
+				break;
+			case CAM_GET_EXPOSURE_ERROR_STAGE:
+			case CAM_GET_EXPOSURE_ERROR_REGISTER:
+			case CAM_GET_EXPOSURE_ERROR_EXPECTED:
+			case CAM_GET_EXPOSURE_ERROR_OBSERVED:
+				retval = exposureError(msg - CAM_GET_EXPOSURE_ERROR_STAGE);
 				break;
 			case CAM_GET_KEY0:
 			case CAM_GET_KEY1:
@@ -185,6 +192,10 @@ int i2cPxiThreadMain(void *arg) {
 			case CAM_MIC_STOP:
 				micStop();
 				retval = CAM_MIC_STOP;
+				break;
+			case CAM_REAR_LIGHT_OFF:
+			case CAM_REAR_LIGHT_ON:
+				retval = setRearLight(msg == CAM_REAR_LIGHT_ON);
 				break;
 			case CAM_LED_OFF:
 			case CAM_LED_ON:

@@ -33,6 +33,12 @@ CaptureMode activeMode = CAPTURE_MODE_PREVIEW;
 alignas(32) static u16 s_frames[CAM_FRAMES][256 * 192];
 
 static bool s_streaming;
+static bool s_streamRequested;
+static bool s_rearLight = true;
+static unsigned s_exposureLines;
+static unsigned s_exposureGain;
+static u16 s_exposureError[EXPOSURE_ERROR_FIELDS];
+static bool s_exposureDirty = true;
 static bool s_modeValid;          // sensor is known to be in activeMode
 static volatile u32 s_frameCount; // frames completed since stream start
 static volatile u8 s_fill;        // buffer the camera is writing right now
@@ -102,12 +108,18 @@ bool cameraActivate(Camera cam) {
 
 	u32 command = (cam == CAM_INNER) ? CAM0_ACTIVATE : CAM1_ACTIVATE;
 	if(pxiSendAndReceive(PXI_CAMERA, command) == command) {
-		activeCamera = cam;
-		s_modeValid  = false; // waking a camera is the safe place to resend the mode
+		activeCamera    = cam;
+		s_exposureDirty = true;
+		s_modeValid     = false; // waking a camera is the safe place to resend the mode
 		return true;
 	} else {
 		return false;
 	}
+}
+
+bool cameraSetRearLight(bool enabled) {
+	s_rearLight = enabled;
+	return pxiSendAndReceive(PXI_CAMERA, enabled ? CAM_REAR_LIGHT_ON : CAM_REAR_LIGHT_OFF) == 1;
 }
 
 bool cameraDeactivate(Camera cam) {
@@ -137,17 +149,32 @@ static bool camWaitDone(u32 vblanks) {
 	return false;
 }
 
-// Sets up the sensor mode and the CAM_CNT format bits, then starts the camera
-// interface. Only called when the interface is not streaming.
-static void camConfigure(CaptureMode mode) {
+static bool camApplyExposure(unsigned lines, unsigned gain);
+
+static void camReadExposureError(void) {
+	for(unsigned i = 0; i < EXPOSURE_ERROR_FIELDS; i++)
+		s_exposureError[i] = pxiSendAndReceive(PXI_CAMERA, CAM_GET_EXPOSURE_ERROR_STAGE + i);
+}
+
+// Sets up the sensor mode and the CAM_CNT format bits while stopped.
+static bool camConfigure(CaptureMode mode) {
 	bool preview = mode == CAPTURE_MODE_PREVIEW;
 
 	if(mode != activeMode || !s_modeValid) {
-		pxiSendAndReceive(PXI_CAMERA, preview ? CAM_SET_MODE_PREVIEW : CAM_SET_MODE_CAPTURE);
-		activeMode  = mode;
-		s_modeValid = true;
+		if(pxiSendAndReceive(PXI_CAMERA, preview ? CAM_SET_MODE_PREVIEW : CAM_SET_MODE_CAPTURE) != mode) {
+			camReadExposureError();
+			return false;
+		}
+		activeMode      = mode;
+		s_modeValid     = true;
+		s_exposureDirty = true;
 	}
 
+	if(s_exposureDirty) {
+		if(!camApplyExposure(s_exposureLines, s_exposureGain))
+			return false;
+		s_exposureDirty = false;
+	}
 	REG_CAM_CNT &= ~BIT(15); // allow changing params
 	if(preview)              // YUV-to-RGB555 and "scanline count - 1" = 3
 		REG_CAM_CNT |= 0x2003;
@@ -155,11 +182,57 @@ static void camConfigure(CaptureMode mode) {
 		REG_CAM_CNT &= ~0x2003;
 	REG_CAM_CNT |= BIT(5); // clear overrun flag, flush till next camera vblank
 	REG_CAM_CNT |= BIT(15);
+	return true;
+}
+
+static bool camApplyExposure(unsigned lines, unsigned gain) {
+	bool ok = pxiSendAndReceive(PXI_CAMERA, CAM_EXPOSURE_REQUEST | lines | (gain << CAM_EXPOSURE_GAIN_SHIFT)) == 1;
+	if(ok) {
+		s_exposureLines = lines;
+		s_exposureGain  = gain;
+		s_exposureDirty = false;
+	}
+	bool restored = ok;
+	if(!ok) {
+		camReadExposureError();
+		restored =
+			pxiSendAndReceive(
+				PXI_CAMERA, CAM_EXPOSURE_REQUEST | s_exposureLines | (s_exposureGain << CAM_EXPOSURE_GAIN_SHIFT)) == 1;
+		s_exposureDirty = !restored;
+	}
+	return ok;
+}
+
+bool cameraSetExposure(unsigned lines, unsigned gain) {
+	for(unsigned i = 0; i < EXPOSURE_ERROR_FIELDS; i++)
+		s_exposureError[i] = 0;
+	if(lines > CAM_EXPOSURE_MAX_LINES || gain > 3 || activeCamera == CAM_NONE)
+		return false;
+	bool resume       = s_streamRequested;
+	unsigned oldLines = s_exposureLines, oldGain = s_exposureGain;
+	cameraStreamStop();
+	bool ok = camApplyExposure(lines, gain);
+	if(resume && !cameraStreamStart()) {
+		if(ok) {
+			bool restored   = camApplyExposure(oldLines, oldGain);
+			s_exposureLines = oldLines;
+			s_exposureGain  = oldGain;
+			s_exposureDirty = !restored;
+			cameraStreamStart();
+		}
+		return false;
+	}
+	return ok;
+}
+
+unsigned cameraExposureError(ExposureErrorField field) {
+	return field < EXPOSURE_ERROR_FIELDS ? s_exposureError[field] : 0;
 }
 
 bool cameraCapture(u16 *dst, CaptureMode mode) {
 	cameraStreamStop();
-	camConfigure(mode);
+	if(!camConfigure(mode))
+		return false;
 
 	u32 bytes = mode == CAPTURE_MODE_PREVIEW ? CAM_PREVIEW_SIZE : (640 * 480 * 2);
 
@@ -186,8 +259,11 @@ bool cameraStreamStart(void) {
 		return false;
 
 	cameraStreamStop();
+	s_streamRequested   = true;
+	s_callsWithoutFrame = 0;
 
-	camConfigure(CAPTURE_MODE_PREVIEW);
+	if(!camConfigure(CAPTURE_MODE_PREVIEW))
+		return false;
 
 	// Drop any dirty lines the CPU may still hold for the capture buffers: the
 	// DMA bypasses the cache and a stray writeback would corrupt a frame.
@@ -222,6 +298,7 @@ void cameraStreamStop(void) {
 	REG_IF = IRQ_NDMA1;
 	irqClear(IRQ_NDMA1);
 	s_streaming = false;
+	s_streamRequested = false;
 }
 
 u16 *cameraNextFrame(void) {
@@ -230,9 +307,10 @@ u16 *cameraNextFrame(void) {
 		// Nothing for a long time means the camera stream died (or the sensor
 		// went into standby); restart it rather than sitting on a frozen
 		// picture forever. Callers poll once per vblank.
-		if(s_streaming && ++s_callsWithoutFrame > 240) {
+		if(s_streamRequested && ++s_callsWithoutFrame > 240) {
 			s_callsWithoutFrame = 0;
-			cameraStreamStart();
+			if(cameraStreamStart())
+				cameraSetRearLight(s_rearLight);
 		}
 		return NULL;
 	}
@@ -250,3 +328,5 @@ u16 *cameraNextFrame(void) {
 u32 cameraStreamOverruns(void) { return s_overruns; }
 
 bool cameraStreamRunning(void) { return s_streaming; }
+
+bool cameraStreamRequested(void) { return s_streamRequested; }

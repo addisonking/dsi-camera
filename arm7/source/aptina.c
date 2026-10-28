@@ -3,6 +3,16 @@
 #include "aptina_i2c.h"
 
 u8 currentDevice = I2C_CAM0;
+static bool s_cameraActive;
+static bool s_rearLight = true;
+
+bool setRearLight(bool enabled) {
+	s_rearLight = enabled;
+	u8 value    = enabled && s_cameraActive && currentDevice == I2C_CAM1;
+	if(!i2cWriteRegister(I2C_PM, I2CREGPM_CAMLED, value) || (i2cReadRegister(I2C_PM, I2CREGPM_CAMLED) & 3) != value)
+		return false;
+	return true;
+}
 
 // Waits until the bits of the register are clear
 void aptWaitClr(u8 device, u16 reg, u16 mask) {
@@ -138,10 +148,9 @@ void activate(u8 device) {
 	aptWriteRegister(
 		device, 0x3012, 0x0010);    // COARSE_INTEGRATION_TIME (Y Time)      ; set to large number for more brightness
 	aptSet(device, 0x001A, 0x0200); // RESET_AND_MISC_CONTROL (Parallel On)  ;-Data on
-	if(device == I2C_CAM1)
-		i2cWriteRegister(0x4A, 0x31, 0x01);
-
-	currentDevice = device;
+	currentDevice  = device;
+	s_cameraActive = true;
+	setRearLight(s_rearLight);
 }
 
 void deactivate(u8 device) {
@@ -149,13 +158,217 @@ void deactivate(u8 device) {
 	aptSet(device, 0x0018, 0x0001);     // STANDBY_CONTROL (set bit0=1=Standby)   ;\.
 	aptWaitSet(device, 0x0018, 0x4000); // STANDBY_CONTROL (wait for StandbyDone) ; Standby
 	aptWaitClr(device, 0x301A, 0x0004); // UNDOC_CORE_301A (wait for StandbyDone) ;/
-	if(device == I2C_CAM1)
-		i2cWriteRegister(0x4A, 0x31, 0x00);
+	s_cameraActive = false;
+	i2cWriteRegister(I2C_PM, I2CREGPM_CAMLED, 0);
 
 	currentDevice = I2C_CAM0;
 }
 
-void setMode(CaptureMode mode) {
-	aptWriteMcu(currentDevice, 0xA103, mode);
-	aptWaitMcuClr(currentDevice, 0xA103, 0xFFFF);
+// Save each sensor's automation and calibrated core values independently.
+static const u16 s_autoRegs[] = {
+	0xA117,
+	0xA11D,
+	0xA123,
+	0xA129, // AE in every preview/transition state
+	0xA118,
+	0xA11E,
+	0xA124,
+	0xA12A, // flicker detection
+	0xA119,
+	0xA11F,
+	0xA125,
+	0xA12B, // white balance
+	0xA11A,
+	0xA120,
+	0xA126,
+	0xA12C, // histogram gain
+	0xA115,
+	0xA102 // capture options, live driver enable mask
+};
+#define AUTO_REG_COUNT (sizeof(s_autoRegs) / sizeof(s_autoRegs[0]))
+static const u16 s_coreRegs[] = {0x3012, 0x3014, 0x302A, 0x302C, 0x302E, 0x3030};
+#define CORE_REG_COUNT (sizeof(s_coreRegs) / sizeof(s_coreRegs[0]))
+static u16 s_autoValues[2][AUTO_REG_COUNT];
+static u16 s_coreValues[2][CORE_REG_COUNT];
+static bool s_manual[2], s_coreValid[2];
+static u16 s_exposureError[EXPOSURE_ERROR_FIELDS];
+
+static bool exposureFail(u16 stage, u16 reg, u16 expected, u16 observed) {
+	if(!s_exposureError[EXPOSURE_ERROR_STAGE]) {
+		s_exposureError[EXPOSURE_ERROR_STAGE]    = stage;
+		s_exposureError[EXPOSURE_ERROR_REGISTER] = reg;
+		s_exposureError[EXPOSURE_ERROR_EXPECTED] = expected;
+		s_exposureError[EXPOSURE_ERROR_OBSERVED] = observed;
+	}
+	return false;
+}
+
+unsigned exposureError(ExposureErrorField field) { return field < EXPOSURE_ERROR_FIELDS ? s_exposureError[field] : 0; }
+
+static bool exposureReadMcu(u16 reg, u16 *value) {
+	if(!aptWriteRegister(currentDevice, 0x098C, reg))
+		return exposureFail(1, reg, 0, 0xFFFF);
+	*value = aptReadRegister(currentDevice, 0x0990);
+	if(*value == 0xFFFF)
+		return exposureFail(1, reg, 0, *value);
+	return true;
+}
+
+static bool exposureWriteMcu(u16 reg, u16 value) {
+	if(!aptWriteRegister(currentDevice, 0x098C, reg) || !aptWriteRegister(currentDevice, 0x0990, value))
+		return exposureFail(2, reg, value, 0xFFFF);
+	u16 observed;
+	if(!exposureReadMcu(reg, &observed))
+		return false;
+	return observed == value || exposureFail(3, reg, value, observed);
+}
+
+bool setMode(CaptureMode mode) {
+	if(!aptWriteRegister(currentDevice, 0x098C, 0xA103) || !aptWriteRegister(currentDevice, 0x0990, mode))
+		return exposureFail(2, 0xA103, mode, 0xFFFF);
+	u16 expected = mode == CAPTURE_MODE_PREVIEW ? 3 : 7;
+	u16 state    = 0xFFFF;
+	for(int i = 0; i <= 180; i++) {
+		u16 command;
+		if(!exposureReadMcu(0xA103, &command) || !exposureReadMcu(0xA104, &state))
+			return false;
+		// Command acceptance precedes context entry and its core-register reload.
+		if(command == 0 && state == expected)
+			return true;
+		if(i < 180)
+			swiWaitForVBlank();
+	}
+	return exposureFail(4, 0xA104, expected, state);
+}
+
+static bool exposureFreeze(int cam) {
+	// SEQ_MODE is the live enable mask. Changing state presets alone leaves
+	// the currently executing AE/AWB drivers free to overwrite manual values.
+	if(!exposureWriteMcu(0xA102, s_autoValues[cam][AUTO_REG_COUNT - 1] & ~0x0F))
+		return false;
+	for(unsigned i = 0; i < AUTO_REG_COUNT - 1; i++) {
+		u16 value = s_autoRegs[i] == 0xA115 ? s_autoValues[cam][i] & ~0x70 : 0;
+		if(!exposureWriteMcu(s_autoRegs[i], value))
+			return false;
+	}
+	return true;
+}
+
+static bool exposureWriteCore(const u16 *values) {
+	u16 hold = aptReadRegister(currentDevice, 0x3022);
+	if(hold == 0xFFFF)
+		return exposureFail(1, 0x3022, 0, hold);
+	if(hold & 0x0100) {
+		hold &= ~0x0100;
+		bool released = false;
+		for(int i = 0; i < 3 && !released; i++)
+			released = aptWriteRegister(currentDevice, 0x3022, hold) && aptReadRegister(currentDevice, 0x3022) == hold;
+		if(!released)
+			return exposureFail(2, 0x3022, hold, aptReadRegister(currentDevice, 0x3022));
+	}
+	bool written = aptWriteRegister(currentDevice, 0x3022, hold | 0x0100) &&
+		aptReadRegister(currentDevice, 0x3022) == (hold | 0x0100);
+	if(!written)
+		exposureFail(2, 0x3022, hold | 0x0100, hold);
+	for(unsigned i = 0; written && i < CORE_REG_COUNT; i++) {
+		if(aptReadRegister(currentDevice, s_coreRegs[i]) == values[i])
+			continue;
+		written = aptWriteRegister(currentDevice, s_coreRegs[i], values[i]) != 0;
+		if(!written)
+			exposureFail(2, s_coreRegs[i], values[i], 0xFFFF);
+	}
+	bool released = false;
+	for(int i = 0; i < 3 && !released; i++)
+		released = aptWriteRegister(currentDevice, 0x3022, hold) && aptReadRegister(currentDevice, 0x3022) == hold;
+	if(!released)
+		exposureFail(2, 0x3022, hold, aptReadRegister(currentDevice, 0x3022));
+	if(!written || !released)
+		return false;
+	// Core writes can latch at the next sensor frame, not the next LCD VBlank.
+	for(int attempt = 0; attempt <= 180; attempt++) {
+		unsigned i;
+		u16 observed = 0;
+		for(i = 0; i < CORE_REG_COUNT; i++) {
+			observed = aptReadRegister(currentDevice, s_coreRegs[i]);
+			if(observed != values[i])
+				break;
+		}
+		if(i == CORE_REG_COUNT)
+			return true;
+		if(attempt == 180)
+			return exposureFail(5, s_coreRegs[i], values[i], observed);
+		swiWaitForVBlank();
+	}
+	return false;
+}
+
+static bool exposureRestore(int cam) {
+	if(!s_manual[cam])
+		return true;
+	if(s_coreValid[cam] && !exposureWriteCore(s_coreValues[cam]))
+		return false;
+	// Restore SEQ_MODE last, after the core and state presets are consistent.
+	for(unsigned i = 0; i < AUTO_REG_COUNT; i++)
+		if(!exposureWriteMcu(s_autoRegs[i], s_autoValues[cam][i]))
+			return false;
+	s_manual[cam] = s_coreValid[cam] = false;
+	return true;
+}
+
+bool setExposure(unsigned lines, unsigned gain) {
+	for(unsigned i = 0; i < EXPOSURE_ERROR_FIELDS; i++)
+		s_exposureError[i] = 0;
+	if(lines > CAM_EXPOSURE_MAX_LINES || gain > 3)
+		return exposureFail(6, 0x3012, CAM_EXPOSURE_MAX_LINES, lines);
+	int cam = currentDevice == I2C_CAM0 ? 0 : 1;
+	if(!lines)
+		return exposureRestore(cam);
+	if(!s_manual[cam]) {
+		for(unsigned i = 0; i < AUTO_REG_COUNT; i++)
+			if(!exposureReadMcu(s_autoRegs[i], &s_autoValues[cam][i]))
+				return false;
+		s_manual[cam] = true;
+	}
+	if(!exposureFreeze(cam))
+		return false;
+	if(!s_coreValid[cam]) {
+		// Finish any auto-function work already in flight before sampling color.
+		for(int i = 0; i < 12; i++)
+			swiWaitForVBlank();
+		for(unsigned i = 0; i < CORE_REG_COUNT; i++) {
+			u16 value = aptReadRegister(currentDevice, s_coreRegs[i]);
+			if(value == 0xFFFF || (i >= 2 && (value < 8 || value > 127)))
+				return exposureFail(1, s_coreRegs[i], i >= 2 ? 8 : 0, value);
+			s_coreValues[cam][i] = value;
+		}
+		s_coreValid[cam] = true;
+	}
+	u16 values[CORE_REG_COUNT];
+	values[0] = lines;
+	values[1] = 0x006B;
+	// Preserve the sensor's calibrated color ratios. Writing GLOBAL_GAIN while
+	// AWB runs both destroys those ratios and makes gain readback unstable.
+	unsigned green   = s_coreValues[cam][2];
+	unsigned factor  = ((8u << gain) * 256 + green / 2) / green;
+	unsigned minimum = 0, maximum = 0xFFFF;
+	for(unsigned i = 2; i < CORE_REG_COUNT; i++) {
+		unsigned base = s_coreValues[cam][i];
+		unsigned low = (8 * 256 + base - 1) / base, high = 127 * 256 / base;
+		if(low > minimum)
+			minimum = low;
+		if(high < maximum)
+			maximum = high;
+	}
+	if(factor < minimum)
+		factor = minimum;
+	if(factor > maximum)
+		factor = maximum;
+	for(unsigned i = 2; i < CORE_REG_COUNT; i++) {
+		unsigned value = (s_coreValues[cam][i] * factor + 128) / 256;
+		// The DSi rounds odd analog codes down even at low gain (13 -> 12).
+		// Higher ranges have a four-code step. Verify the achievable value.
+		value &= value >= 64 ? ~3u : ~1u;
+		values[i] = value;
+	}
+	return exposureWriteCore(values);
 }
