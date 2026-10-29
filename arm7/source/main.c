@@ -36,6 +36,8 @@
 #include "i2c_handler.h"
 
 // #include <calico.h>
+#include <calico/nds/arm7/i2c.h>
+#include <calico/nds/arm7/mcu.h>
 #include <nds.h>
 #include <string.h>
 // #include <maxmod7.h>
@@ -45,6 +47,19 @@
 // a BIOS dump for the key that reproduces a real photo's AES-CCM MAC.
 u32 g_cameraKey[4];
 #define CAMERA_KEY_ADDR 0x03FFC5B0
+
+static void startupPowerInit(void) {
+	if(systemIsTwlMode()) {
+		mcuInit();
+		i2cLock();
+		// Reading acknowledges power-button events left over from the launcher.
+		unsigned pending = i2cReadRegister8(I2cDev_MCU, McuReg_IrqFlags);
+		i2cUnlock();
+		if(pending & (MCU_IRQ_PWRBTN_SHUTDOWN | MCU_IRQ_BATTERY_EMPTY))
+			mcuIssueShutdown();
+	}
+	pmInit();
+}
 
 //---------------------------------------------------------------------------------
 int main() {
@@ -68,7 +83,7 @@ int main() {
 	rtcSyncTime();
 
 	// Initialize power management
-	pmInit();
+	startupPowerInit();
 
 	// Set up block device peripherals
 	blkInit();

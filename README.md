@@ -26,6 +26,10 @@ A homebrew camera app for the Nintendo DSi. Fork of [Pk11's dsi-camera](https://
 | SELECT | Album |
 | START | Exit |
 
+The touch screen supports capture, the photo/video labels, album, controls,
+and camera switch. In Controls, tap an on/off value to toggle it, or tap left
+or right of a numeric value to adjust. Delete confirmations support touch too.
+
 ## Building
 
 Requires [devkitPro](https://devkitpro.org) with devkitARM, libnds, and calico.
@@ -48,6 +52,33 @@ survive export to the DSi album and conversion on a PC. It's applied at capture
 time only; existing photos are never modified, and the live viewfinder stays
 clean.
 
+## UI preview
+
+The interface uses a black background and small, pixel-aligned IBM Plex Mono
+bitmap text without antialiasing. Controls open while photo saves finish in the
+background; unchanged exposure settings keep the preview stream running.
+The font is licensed under the SIL Open Font License; see `tools/ui/OFL-IBMPlexMono.txt`.
+The bitmap subset is compiled into the app and needs no font files on the SD card.
+
+To render the actual C drawing code on a host (requires clang, Python, and Pillow):
+
+```sh
+python3 tools/ui/render.py
+```
+
+Captures are written to `/tmp/dsi-camera-ui-dark/`, including `overview.png`.
+The renderer checks UI states, every delete/cancel touch coordinate through the
+real confirmation loop, Night Burst cancellation input, complete video diagnostics,
+and scroll/clipping bounds with AddressSanitizer and UndefinedBehaviorSanitizer.
+Long status messages use two lines; ordinary status messages stay on one.
+It uses fixture settings; camera hardware and touch behavior still need a
+physical DSi.
+To regenerate the font subset from the IBM Plex Mono Regular TTF:
+
+```sh
+python3 tools/ui/font.py /path/to/IBMPlexMono-Regular.ttf
+```
+
 ## Credits
 
 - [Pk11](https://github.com/Epicpkmn11) for the original app
@@ -58,7 +89,7 @@ clean.
 ## Advanced controls
 
 Press **X**. Use up/down to select a row and left/right to adjust,
-or tap the arrows beside a value. Press **A** on Shutter or White Balance to return to Auto,
+or tap left/right beside a value. Press **A** on Shutter or White Balance to return to Auto,
 on Gain, Night Burst, Rear Light, or Timestamp to cycle/toggle, or on Reset to restore all
 settings. Press **B** or **X** to return to the viewfinder. The top screen stays
 live while adjusting. Gain is gray and cannot be selected until Shutter is manual.
@@ -85,7 +116,7 @@ Rear Light is available whenever the outer camera is selected.
   not a calibrated color temperature or a sensor setting. The live preview is
   an approximation of the saved result.
 - **Night Burst:** one shutter press captures four frames and saves one merged
-  photo. Hold still; press B to cancel. Alignment compensates for small camera
+  photo. Hold still; press B or tap the screen to cancel between frames. Alignment compensates for small camera
   shifts, and changed pixels are rejected to limit ghosting. If alignment fails,
   the first frame supplies the affected detail. It reduces noise without raising
   brightness or recovering clipped highlights. Use a longer manual integration

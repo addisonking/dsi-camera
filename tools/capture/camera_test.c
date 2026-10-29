@@ -58,12 +58,16 @@ void irqSet(u32 mask, void (*handler)(void)) {
 	(void)mask;
 	(void)handler;
 }
-void irqEnable(u32 mask) { (void)mask; }
+void irqEnable(u32 mask) {
+	(void)mask;
+	assert(!(REG_CAM_CNT & BIT(15)));
+}
 void irqDisable(u32 mask) { (void)mask; }
 void irqClear(u32 mask) { (void)mask; }
 void armDCacheFlush(const void *address, unsigned size) {
 	(void)address;
 	(void)size;
+	assert(!(REG_CAM_CNT & BIT(15)));
 }
 void armDCacheInvalidate(const void *address, unsigned size) {
 	(void)address;
@@ -79,6 +83,10 @@ int main(void) {
 	assert(cameraActivate(CAM_OUTER));
 	assert(cameraSetExposure(64, 2));
 	assert(cameraStreamStart() && cameraStreamRunning());
+	camDmaIsr();
+	unsigned unchangedCalls = exposureCalls;
+	assert(cameraSetExposure(64, 2));
+	assert(exposureCalls == unchangedCalls && s_frameCount == 1 && cameraStreamRunning());
 
 	failures = 1;
 	assert(!cameraSetExposure(640, 3));
@@ -141,5 +149,40 @@ int main(void) {
 	assert(cameraStreamStart());
 	pollPreview();
 	assert(!light && lightWrites == writes + 1);
-	puts("camera: apply/rollback faults, preview retry, mode entry, capture and intentional stop passed");
+
+	// A FIFO error must not publish a frame that spans two sensor frames.
+	u32 overruns = cameraStreamOverruns();
+	REG_CAM_CNT &= ~BIT(4);
+	u16 *frame = s_frames[s_fill];
+	for(unsigned y = 0; y < 192; y++)
+		for(unsigned x = 0; x < 256; x++)
+			frame[y * 256 + x] = y;
+	camDmaIsr();
+	assert(cameraNextFrame() == frame);
+	assert(frame[0] == 0 && frame[191 * 256] == 191);
+
+	u32 completed = s_frameCount;
+	REG_CAM_CNT |= BIT(4);
+	camDmaIsr();
+	assert(s_frameCount == completed);
+	assert(cameraStreamOverruns() == overruns + 1);
+	assert(!cameraStreamRunning() && cameraStreamRequested());
+	assert(!(REG_CAM_CNT & BIT(15)) && !REG_NDMA1CNT);
+	assert(cameraNextFrame() == NULL);
+	assert(cameraStreamRunning() && s_frameCount == 0);
+	assert((REG_CAM_CNT & (BIT(5) | BIT(15))) == (BIT(5) | BIT(15)));
+	assert(REG_NDMA1CNT == CAM_NDMA_CFG && REG_NDMA1TCNT == CAM_PREVIEW_WORDS);
+	assert(cameraNextFrame() == NULL);
+
+	REG_CAM_CNT &= ~BIT(4); // hardware clears the error when the FIFO is flushed
+	frame = s_frames[s_fill];
+	camDmaIsr();
+	assert(cameraNextFrame() == frame);
+	REG_CAM_CNT |= BIT(4);
+	camDmaIsr();
+	assert(cameraStreamOverruns() == overruns + 2);
+	cameraStreamStop();
+	pollPreview();
+	assert(!cameraStreamRunning() && !cameraStreamRequested());
+	puts("camera: exposure faults, preview retry, DMA startup, FIFO resync, capture and stop passed");
 }

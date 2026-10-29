@@ -32,7 +32,7 @@ CaptureMode activeMode = CAPTURE_MODE_PREVIEW;
 #define CAM_FRAMES 3
 alignas(32) static u16 s_frames[CAM_FRAMES][256 * 192];
 
-static bool s_streaming;
+static volatile bool s_streaming;
 static bool s_streamRequested;
 static bool s_rearLight = true;
 static unsigned s_exposureLines;
@@ -43,28 +43,27 @@ static bool s_modeValid;          // sensor is known to be in activeMode
 static volatile u32 s_frameCount; // frames completed since stream start
 static volatile u8 s_fill;        // buffer the camera is writing right now
 static volatile u32 s_overruns;   // CAM_CNT.4 episodes seen in the ISR
-static bool s_overrunSeen;        // CAM_CNT.4 stays latched until a flush
+static volatile bool s_resync;    // discard a misaligned frame and restart outside the ISR
 static u32 s_seen;                // frames handed to the caller so far
 static u32 s_callsWithoutFrame;   // stall watchdog for cameraNextFrame
 
 // Re-arm straight from the completion IRQ so the gap between frames is a few
 // microseconds, not the time it takes the main loop to notice and copy.
 static void camDmaIsr(void) {
+	if(REG_CAM_CNT & BIT(4)) {
+		s_overruns++;
+		REG_CAM_CNT &= ~BIT(15);
+		REG_NDMA1CNT = 0;
+		s_streaming  = false;
+		s_resync     = true;
+		return;
+	}
+
 	int next = s_fill + 1;
 	if(next == CAM_FRAMES)
 		next = 0;
 	s_fill = (u8)next;
 	s_frameCount++;
-
-	// Bit 4 latches until it is cleared with bit 5, so count episodes, not
-	// every frame that happens to still see it.
-	if(REG_CAM_CNT & BIT(4)) {
-		if(!s_overrunSeen)
-			s_overruns++;
-		s_overrunSeen = true;
-	} else {
-		s_overrunSeen = false;
-	}
 
 	REG_NDMA1DAD  = (u32)s_frames[next];
 	REG_NDMA1TCNT = CAM_PREVIEW_WORDS;
@@ -180,8 +179,6 @@ static bool camConfigure(CaptureMode mode) {
 		REG_CAM_CNT |= 0x2003;
 	else // raw YUV and "scanline count - 1" = 0
 		REG_CAM_CNT &= ~0x2003;
-	REG_CAM_CNT |= BIT(5); // clear overrun flag, flush till next camera vblank
-	REG_CAM_CNT |= BIT(15);
 	return true;
 }
 
@@ -208,6 +205,8 @@ bool cameraSetExposure(unsigned lines, unsigned gain) {
 		s_exposureError[i] = 0;
 	if(lines > CAM_EXPOSURE_MAX_LINES || gain > 3 || activeCamera == CAM_NONE)
 		return false;
+	if(!s_exposureDirty && lines == s_exposureLines && gain == s_exposureGain && (!s_streamRequested || s_streaming))
+		return true;
 	bool resume       = s_streamRequested;
 	unsigned oldLines = s_exposureLines, oldGain = s_exposureGain;
 	cameraStreamStop();
@@ -245,7 +244,9 @@ bool cameraCapture(u16 *dst, CaptureMode mode) {
 	REG_NDMA1TCNT = (mode == CAPTURE_MODE_PREVIEW ? CAM_PREVIEW_WORDS : (640 * 480) / 2);
 	REG_NDMA1WCNT = (mode == CAPTURE_MODE_PREVIEW ? 512 : 320);
 	REG_NDMA1BCNT = 2;
-	REG_NDMA1CNT  = CAM_NDMA_ONE;
+	REG_CAM_CNT |= BIT(5); // flush stale data before arming DMA and enabling capture
+	REG_NDMA1CNT = CAM_NDMA_ONE;
+	REG_CAM_CNT |= BIT(15);
 
 	bool ok = camWaitDone(120); // ~2s at 60Hz
 	if(ok)                      // the DMA wrote around the cache, drop whatever the CPU still has
@@ -272,7 +273,6 @@ bool cameraStreamStart(void) {
 	s_fill              = 0;
 	s_frameCount        = 0;
 	s_seen              = 0;
-	s_overrunSeen       = false;
 	s_callsWithoutFrame = 0;
 	s_streaming         = true;
 
@@ -285,7 +285,9 @@ bool cameraStreamStart(void) {
 	REG_NDMA1TCNT = CAM_PREVIEW_WORDS;
 	REG_NDMA1WCNT = 512;
 	REG_NDMA1BCNT = 2;
-	REG_NDMA1CNT  = CAM_NDMA_CFG;
+	REG_CAM_CNT |= BIT(5); // flush stale data before arming DMA and enabling capture
+	REG_NDMA1CNT = CAM_NDMA_CFG;
+	REG_CAM_CNT |= BIT(15);
 	return true;
 }
 
@@ -297,11 +299,17 @@ void cameraStreamStop(void) {
 	REG_CAM_CNT &= ~BIT(15);
 	REG_IF = IRQ_NDMA1;
 	irqClear(IRQ_NDMA1);
-	s_streaming = false;
+	s_streaming       = false;
 	s_streamRequested = false;
+	s_resync          = false;
 }
 
 u16 *cameraNextFrame(void) {
+	if(s_resync) {
+		cameraStreamStart();
+		return NULL;
+	}
+
 	u32 count = s_frameCount;
 	if(count == s_seen || count == 0) {
 		// Nothing for a long time means the camera stream died (or the sensor
