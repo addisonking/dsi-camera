@@ -1,5 +1,6 @@
 #include "camera.h"
 #include "night.h"
+#include "ui_font.h"
 #include "version.h"
 #include "white_balance.h"
 
@@ -16,7 +17,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/statvfs.h>
 #include <time.h>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -38,9 +38,9 @@
 
 int clamp(int val, int min, int max) { return val < min ? min : (val > max ? max : val); }
 
-static u16 *s_subGfx;       // bottom-screen bitmap, drawn by the ui* helpers
-static Camera s_camera;     // currently active camera
-static bool s_videoMode;    // camera screen: photo vs video mode
+static u16 *s_subGfx;    // bottom-screen bitmap, drawn by the ui* helpers
+static Camera s_camera;  // currently active camera
+static bool s_videoMode; // camera screen: photo vs video mode
 static const unsigned s_shutterLines[] = {0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 640};
 #define SHUTTER_COUNT (sizeof(s_shutterLines) / sizeof(s_shutterLines[0]))
 static unsigned s_shutter;
@@ -49,12 +49,45 @@ static int s_warmth;
 static bool s_nightBurst;
 static bool s_rearLight = true;
 static bool s_timestamp;    // burn the capture time into saved pixels
-static char s_savedMsg[48]; // last "saved video" summary, kept after the redraw
+static char s_savedMsg[96]; // last "saved video" summary, kept after the redraw
 static void uiStatus(const char *s);
-void uiSpace(void);
+static void uiRecordingScreen(void);
 static void watermarkYuv(u16 *yuv, time_t t);
 static void watermarkFrame(u16 *gfx, time_t t);
 static void drainJobs(void);
+
+static u16 uiCameraTap(int x, int y, bool fatInited) {
+	if(x >= 170 && y >= 8 && y <= 34)
+		return KEY_A;
+	if(!fatInited)
+		return 0;
+	if(y >= 8 && y <= 34 && x >= 12 && x <= 112)
+		return (x >= 61) != s_videoMode ? KEY_Y : 0;
+	if(x >= 64 && x <= 192 && y >= 88 && y <= 120)
+		return KEY_L;
+	if(y >= 140 && y <= 161) {
+		if(x >= 12 && x <= 96)
+			return KEY_SELECT;
+		if(x >= 174 && x <= 244)
+			return KEY_X;
+	}
+	return 0;
+}
+
+static u16 uiConfirmTap(int x, int y) {
+	if(y < 108 || y > 129)
+		return 0;
+	if(x >= 25 && x < 119)
+		return KEY_B;
+	if(x >= 133 && x < 231)
+		return KEY_A;
+	return 0;
+}
+
+static bool captureCancelled(void) {
+	scanKeys();
+	return (keysDown() & (KEY_B | KEY_TOUCH)) || (keysHeld() & KEY_LID) || pmShouldReset();
+}
 
 // The viewfinder is a continuous camera stream now. camera.c owns the state;
 // these wrappers just avoid restarting a stream that is already running.
@@ -380,7 +413,7 @@ static int workerMain(void *arg) {
 				if(!saved)
 					remove(path);
 			}
-			snprintf(msg, sizeof(msg), saved ? "SAVED IMG_%04d" : "SAVE FAILED: IMG_%04d", (int)job->aux);
+			snprintf(msg, sizeof(msg), saved ? "Saved IMG_%04d" : "Could not save IMG_%04d", (int)job->aux);
 			uiStatus(msg);
 
 			// Thumbnail cache for the album grid.
@@ -420,7 +453,7 @@ static int workerMain(void *arg) {
 // sleeping, or opening the viewer so the photo list is complete.
 static void drainJobs(void) {
 	if(JOBS_PENDING)
-		uiStatus("SAVING...");
+		uiStatus("Saving...");
 	while(JOBS_PENDING)
 		swiWaitForVBlank();
 }
@@ -441,7 +474,7 @@ static bool captureRaw(u16 *previewGfx) {
 		if(!JOBS_PENDING) {
 			free(yuv);
 			free(job);
-			uiStatus("NOT ENOUGH MEMORY");
+			uiStatus("Not enough memory. Try again.");
 			return false;
 		}
 		swiWaitForVBlank();
@@ -452,7 +485,7 @@ static bool captureRaw(u16 *previewGfx) {
 	u16 *next         = NULL;
 	const char *error = "CAMERA FAILED - TRY AGAIN";
 	if(s_nightBurst)
-		uiStatus("HOLD STILL  1/4  B: CANCEL");
+		uiStatus("Hold still  1/4  B/tap: cancel");
 	if(!cameraCapture(yuv, CAPTURE_MODE_CAPTURE))
 		goto fail;
 	memcpy(yuv, yuv + 640, 640 * sizeof(u16));
@@ -461,29 +494,27 @@ static bool captureRaw(u16 *previewGfx) {
 		next  = (u16 *)memalign(32, RAW_SIZE);
 		stack = nightCreate((const u8 *)yuv);
 		if(!next || !stack) {
-			error = "NOT ENOUGH MEMORY";
+			error = "Not enough memory. Try again.";
 			goto fail;
 		}
 		for(int i = 1; i < NIGHT_FRAMES; i++) {
-			scanKeys();
-			if((keysDown() & KEY_B) || (keysHeld() & KEY_LID) || pmShouldReset()) {
-				error = "NIGHT BURST CANCELLED";
+			if(captureCancelled()) {
+				error = "Night Burst cancelled";
 				goto fail;
 			}
 			char msg[40];
-			sprintf(msg, "HOLD STILL  %d/4  B: CANCEL", i + 1);
+			sprintf(msg, "Hold still  %d/4  B/tap: cancel", i + 1);
 			uiStatus(msg);
 			if(!cameraCapture(next, CAPTURE_MODE_CAPTURE))
 				goto fail;
 			memcpy(next, next + 640, 640 * sizeof(u16));
 			nightAdd(stack, (const u8 *)next);
 		}
-		scanKeys();
-		if((keysDown() & KEY_B) || (keysHeld() & KEY_LID) || pmShouldReset()) {
-			error = "NIGHT BURST CANCELLED";
+		if(captureCancelled()) {
+			error = "Night Burst cancelled";
 			goto fail;
 		}
-		uiStatus("PROCESSING...");
+		uiStatus("Processing...");
 		nightFinish(stack, (u8 *)yuv);
 		nightFree(stack);
 		free(next);
@@ -605,7 +636,7 @@ static void playVideo(u16 *gfx, int num) {
 	}
 	fseek(fa, sizeof(hdr), SEEK_SET);
 
-	uiStatus("LOADING...");
+	uiStatus("Loading...");
 
 	// Prebuffer two ring halves of audio (zero-padded = silence).
 	memset(s_playRing, 0, sizeof(s_playRing));
@@ -714,7 +745,7 @@ static void playVideo(u16 *gfx, int num) {
 			lastSec = sec;
 			char msg[40];
 			sprintf(msg,
-					"PLAYING %d:%02d / %lu:%02lu",
+					"Playing %d:%02d / %lu:%02lu",
 					sec / 60,
 					sec % 60,
 					(unsigned long)(durSec / 60),
@@ -728,7 +759,7 @@ static void playVideo(u16 *gfx, int num) {
 	fclose(fa);
 	fclose(fv);
 	free(stage);
-	uiStatus("B: BACK");
+	uiStatus("B to return");
 }
 
 // Records video + mic audio to a .VID container until L/R is tapped again (or
@@ -789,6 +820,7 @@ static void recordVideo(u16 *gfx, int num) {
 	// as a freeze right at the start of the clip.
 	u32 ovStart = cameraStreamOverruns();
 	streamStart();
+	uiRecordingScreen();
 
 	u32 keepEvery   = 1000 / VID_FPS;
 	u32 nextKeep    = 0;
@@ -802,6 +834,12 @@ static void recordVideo(u16 *gfx, int num) {
 	while(!stop) {
 		swiWaitForVBlank();
 		scanKeys();
+		if(keysDown() & KEY_TOUCH) {
+			touchPosition touch;
+			touchRead(&touch);
+			if(uiCameraTap(touch.px, touch.py, true) == KEY_L)
+				stop = true;
+		}
 		if(keysDown() & (KEY_L | KEY_R) || (keysHeld() & KEY_LID) || pmShouldReset())
 			stop = true;
 
@@ -863,7 +901,7 @@ static void recordVideo(u16 *gfx, int num) {
 		if(sec != lastSec) {
 			lastSec = sec;
 			char msg[24];
-			sprintf(msg, "%s REC %d:%02d", (sec & 1) ? "*" : " ", sec / 60, sec % 60);
+			sprintf(msg, "%d:%02d", sec / 60, sec % 60);
 			uiStatus(msg);
 		}
 	}
@@ -876,7 +914,7 @@ static void recordVideo(u16 *gfx, int num) {
 	streamStop(); // no waiting on a possibly wedged DMA
 
 	// Let the worker finish the remaining chunks, then patch the totals.
-	uiStatus("SAVING...");
+	uiStatus("Saving...");
 	while(JOBS_PENDING)
 		swiWaitForVBlank();
 	u32 durMs = (u32)((u64)recTicks * 1000 / PLAY_TIMER_HZ);
@@ -912,21 +950,20 @@ static void recordVideo(u16 *gfx, int num) {
 	u32 gapS = maxGapMs / 1000;
 	if(gapS > 999)
 		gapS = 999;
-	char msg[48];
+	char msg[96];
 	snprintf(msg,
 			 sizeof(msg),
-			 "VID_%04d %lu.%luFPS D:%lu A:%lu O:%lu G:%lu.%lus",
+			 "VID_%04d %lu.%luFPS G:%lu.%lus D:%lu A:%lu O:%lu",
 			 num,
 			 (unsigned long)(fps10 / 10),
 			 (unsigned long)(fps10 % 10),
+			 (unsigned long)gapS,
+			 (unsigned long)((maxGapMs / 100) % 10),
 			 (unsigned long)framesDropped,
 			 (unsigned long)s_audDropped,
-			 (unsigned long)(cameraStreamOverruns() - ovStart),
-			 (unsigned long)gapS,
-			 (unsigned long)((maxGapMs / 100) % 10));
+			 (unsigned long)(cameraStreamOverruns() - ovStart));
 	uiStatus(msg);
 	snprintf(s_savedMsg, sizeof(s_savedMsg), "%s", msg);
-	uiSpace();
 }
 
 // Fallback numbering for Album export when pit.bin is unusable.
@@ -1034,6 +1071,11 @@ static bool confirmAB(void) {
 		swiWaitForVBlank();
 		scanKeys();
 		u16 p = keysDown();
+		if(p & KEY_TOUCH) {
+			touchPosition touch;
+			touchRead(&touch);
+			p |= uiConfirmTap(touch.px, touch.py);
+		}
 		if(p & KEY_A)
 			return true;
 		if(p & KEY_B || pmShouldReset())
@@ -1080,9 +1122,9 @@ static void getThumb(int num, bool isVideo, u16 *out) {
 // --- Album gallery: one continuous scrolling layout, photos in rows of 4
 // --- grouped under per-day headers, with eased scrolling.
 
-#define HEADER_H 14
+#define HEADER_H 23
 #define ROW_H (THUMB_H + 2)
-#define SECTION_GAP 4
+#define SECTION_GAP 7
 #define SCREEN_H 192
 
 // 5x7 pixel font (columns, LSB = top row) for the date headers; covers
@@ -1218,102 +1260,123 @@ static void watermarkFrame(u16 *gfx, time_t t) {
 	drawText(gfx, x, y, s, BIT(15) | RGB15(31, 31, 31));
 }
 
-// --- Bottom-screen UI: minimalist monochrome panels drawn with the pixel
-// --- font instead of a scrolling console.
+// --- Bottom-screen UI, rendered directly into the RGB555 bitmap.
 
-#define UI_BG (BIT(15) | RGB15(3, 3, 4))
-#define UI_FG (BIT(15) | RGB15(28, 28, 29))
-#define UI_DIM (BIT(15) | RGB15(13, 13, 15))
+#define UI_BG BIT(15)
+#define UI_FG (BIT(15) | RGB15(28, 28, 28))
+#define UI_DIM (BIT(15) | RGB15(17, 17, 17))
+#define UI_DISABLED (BIT(15) | RGB15(10, 10, 10))
+#define UI_ALERT (BIT(15) | RGB15(28, 8, 8))
 
 static void uiRect(int x, int y, int w, int h, u16 col) {
-	for(int yy = y; yy < y + h; yy++)
-		for(int xx = x; xx < x + w; xx++)
+	for(int yy = clamp(y, 0, SCREEN_H); yy < clamp(y + h, 0, SCREEN_H); yy++)
+		for(int xx = clamp(x, 0, 256); xx < clamp(x + w, 0, 256); xx++)
 			s_subGfx[yy * 256 + xx] = col;
 }
 
-static void uiText(int x, int y, const char *s, u16 col) { drawText(s_subGfx, x, y, s, col); }
+static int uiTextWidth(const char *s, const UiFont *font) {
+	int width = 0;
+	for(; *s; s++) {
+		unsigned c = (unsigned char)*s;
+		width += font->glyphs[(c >= 32 && c <= 126 ? c : '?') - 32].advance;
+	}
+	return width;
+}
 
-static void uiTextCenter(int y, const char *s, u16 col) { uiText((256 - (int)strlen(s) * 6) / 2, y, s, col); }
-
-// Double-size text for headers.
-static void uiText2(int x, int y, const char *s, u16 col) {
-	for(; *s; s++, x += 12) {
-		const u8 *g = glyph(*s);
-		for(int cx = 0; cx < 5; cx++) {
-			for(int cy = 0; cy < 7; cy++) {
-				if(!(g[cx] >> cy & 1))
+static void uiDrawText(u16 *gfx, int x, int y, const char *s, u16 col, const UiFont *font) {
+	for(; *s && x < 256; s++) {
+		unsigned c       = (unsigned char)*s;
+		const UiGlyph *g = &font->glyphs[(c >= 32 && c <= 126 ? c : '?') - 32];
+		int stride       = (g->width + 3) / 4;
+		for(int cy = 0; cy < font->height; cy++) {
+			int yy = y + cy;
+			if(yy < 0 || yy >= SCREEN_H)
+				continue;
+			for(int cx = 0; cx < g->width; cx++) {
+				int xx = x + cx;
+				if(xx < 0 || xx >= 256)
 					continue;
-				int xx = x + cx * 2, yy = y + cy * 2;
-				s_subGfx[yy * 256 + xx]           = col;
-				s_subGfx[yy * 256 + xx + 1]       = col;
-				s_subGfx[(yy + 1) * 256 + xx]     = col;
-				s_subGfx[(yy + 1) * 256 + xx + 1] = col;
+				unsigned a = (font->pixels[g->offset + cy * stride + cx / 4] >> (cx % 4 * 2)) & 3;
+				if(!a)
+					continue;
+				u16 bg             = gfx[yy * 256 + xx];
+				unsigned r         = ((col & 31) * a + (bg & 31) * (3 - a)) / 3;
+				unsigned green     = (((col >> 5) & 31) * a + ((bg >> 5) & 31) * (3 - a)) / 3;
+				unsigned b         = (((col >> 10) & 31) * a + ((bg >> 10) & 31) * (3 - a)) / 3;
+				gfx[yy * 256 + xx] = BIT(15) | RGB15(r, green, b);
 			}
 		}
+		x += g->advance;
 	}
 }
 
-// Clears the screen and draws the title bar.
+static void uiText(int x, int y, const char *s, u16 col) { uiDrawText(s_subGfx, x, y, s, col, &ui_font_11); }
+
+static void uiTextCenter(int y, const char *s, u16 col) { uiText((256 - uiTextWidth(s, &ui_font_11)) / 2, y, s, col); }
+
+static void uiSmall(int x, int y, const char *s, u16 col) { uiDrawText(s_subGfx, x, y, s, col, &ui_font_10); }
+
 static void uiHeader(const char *title) {
 	uiRect(0, 0, 256, SCREEN_H, UI_BG);
-	uiText2((256 - (int)strlen(title) * 12) / 2, 12, title, UI_FG);
-	uiRect(24, 34, 208, 1, UI_DIM);
+	uiText(16, 14, title, UI_FG);
 }
 
-// One-line status at the bottom of the screen (safe to call from the worker
-// thread; it only touches its own strip).
+// The worker only draws inside these two status rows.
 static void uiStatus(const char *s) {
-	uiRect(0, 178, 256, 14, UI_BG);
-	uiTextCenter(182, s, UI_DIM);
+	uiRect(0, 164, 256, 28, UI_BG);
+	const UiFont *font = &ui_font_10;
+	char line[96];
+	snprintf(line, sizeof(line), "%s", s);
+	size_t split = strlen(line);
+	while(split && uiTextWidth(line, font) > 240)
+		line[--split] = '\0';
+	if(s[split]) {
+		char *space = strrchr(line, ' ');
+		if(space && space != line && uiTextWidth(s + (space - line) + 1, font) <= 240) {
+			split       = space - line;
+			line[split] = '\0';
+		}
+		uiSmall((256 - uiTextWidth(line, font)) / 2, 164, line, UI_DIM);
+		const char *rest = s + split;
+		if(*rest == ' ')
+			rest++;
+		snprintf(line, sizeof(line), "%s", rest);
+		while(strlen(line) > 3 && uiTextWidth(line, font) > 240)
+			line[strlen(line) - 1] = '\0';
+		if(uiTextWidth(rest, font) > 240 && strlen(line) > 3)
+			strcpy(line + strlen(line) - 3, "...");
+	}
+	uiSmall((256 - uiTextWidth(line, font)) / 2, 179, line, UI_DIM);
 }
 
-// A right-aligned key hint column and left-aligned action, one row.
 static void uiKey(int y, const char *key, const char *action) {
-	uiText(116 - (int)strlen(key) * 6, y, key, UI_DIM);
-	uiText(126, y, action, UI_FG);
-}
-
-// Free/total SD space, drawn just under the camera name. Safe to call from
-// the worker thread; it only touches its own strip.
-void uiSpace(void) {
-	struct statvfs sv;
-	uiRect(0, 58, 256, 10, UI_BG);
-	if(statvfs("/", &sv) != 0 || !sv.f_blocks)
-		return;
-	u64 freeB = (u64)sv.f_bavail * sv.f_frsize;
-	u64 totB  = (u64)sv.f_blocks * sv.f_frsize;
-	char s[32];
-	sprintf(s, "%.1f GB FREE OF %.1f", (double)freeB / 1e9, (double)totB / 1e9);
-	uiTextCenter(58, s, UI_DIM);
+	uiSmall(16, y, key, UI_DIM);
+	uiText(62, y - 1, action, UI_FG);
 }
 
 static void uiCameraScreen(int cam, bool fatInited) {
-	uiHeader("CAMERA");
-	char sub[36];
-	sprintf(sub, "%s CAMERA - %s", cam == CAM_INNER ? "INNER" : "OUTER", s_videoMode ? "VIDEO" : "PHOTO");
-	uiTextCenter(44, sub, UI_DIM);
-	uiSpace();
-
-	int y = 78;
-	if(fatInited) {
-		uiKey(y, "L/R", s_videoMode ? "RECORD" : s_nightBurst ? "NIGHT PHOTO" : "TAKE PHOTOS");
-		uiKey(y += 14, "Y", s_videoMode ? "PHOTO MODE" : "VIDEO MODE");
-		uiKey(y += 14, "A", "SWAP CAMERA");
-		uiKey(y += 14, "X", "ADVANCED");
-		uiKey(y += 14, "SELECT", "ALBUM");
-	} else {
-		uiTextCenter(y, "NO SD CARD - CANT SAVE", UI_FG);
-		uiKey(y += 14, "A", "SWAP CAMERA");
+	uiHeader("");
+	uiText(16, 14, "photo", s_videoMode ? UI_DIM : UI_FG);
+	uiText(65, 14, "video", s_videoMode ? UI_FG : UI_DIM);
+	uiSmall(186, 15, cam == CAM_INNER ? "inner / A" : "outer / A", UI_DIM);
+	if(!fatInited) {
+		uiTextCenter(98, "insert SD card to save", UI_DIM);
+		return;
 	}
-	uiKey(y += 14, "START", "EXIT");
+	uiTextCenter(98, s_videoMode ? "L/R record" : s_nightBurst ? "L/R night photo" : "L/R capture", UI_FG);
+	uiSmall(16, 146, "select album", UI_DIM);
+	uiSmall(180, 146, "X controls", UI_DIM);
 }
 
-#define UI_ACCENT (BIT(15) | RGB15(31, 25, 5))
-#define UI_PANEL (BIT(15) | RGB15(6, 6, 7))
+static void uiRecordingScreen(void) {
+	uiHeader("");
+	uiText(16, 14, "recording", UI_ALERT);
+	uiTextCenter(98, "L/R stop", UI_FG);
+}
 
 enum { ADV_SHUTTER, ADV_GAIN, ADV_WHITE_BALANCE, ADV_NIGHT, ADV_REAR_LIGHT, ADV_TIMESTAMP, ADV_RESET, ADV_COUNT };
-#define ADV_ROW_Y 52
-#define ADV_ROW_H 14
+#define ADV_ROW_Y 40
+#define ADV_ROW_H 17
 
 static bool advancedRowEnabled(int row) {
 	if(row == ADV_SHUTTER || row == ADV_WHITE_BALANCE || row == ADV_NIGHT)
@@ -1333,53 +1396,51 @@ static int advancedMoveSelection(int selected, int direction) {
 }
 
 static void uiAdvancedScreen(int selected) {
-	uiHeader("ADVANCED");
-	uiTextCenter(43, s_videoMode ? "VIDEO - PHOTO CONTROLS LOCKED" : "PHOTO", UI_DIM);
-	const char *labels[] = {"SHUTTER", "GAIN", "WHITE BALANCE", "NIGHT BURST", "REAR LIGHT", "TIMESTAMP", "RESET"};
+	uiHeader("controls");
+	uiSmall(204, 15, "B back", UI_DIM);
+	const char *labels[] = {"shutter", "gain", "white balance", "night burst", "rear light", "timestamp", "reset"};
 	char shutter[16], gain[16], warmth[16];
 	if(!s_warmth || s_videoMode)
-		strcpy(warmth, "AUTO");
+		strcpy(warmth, "auto");
 	else
-		sprintf(warmth, "%s %d", s_warmth > 0 ? "WARM" : "COOL", abs(s_warmth));
+		sprintf(warmth, "%s %d", s_warmth > 0 ? "warm" : "cool", abs(s_warmth));
 	if(!s_videoMode && s_shutter)
-		sprintf(shutter, "%u LINE%s", s_shutterLines[s_shutter], s_shutterLines[s_shutter] == 1 ? "" : "S");
+		sprintf(shutter, "%u line%s", s_shutterLines[s_shutter], s_shutterLines[s_shutter] == 1 ? "" : "s");
 	else
-		strcpy(shutter, "AUTO");
+		strcpy(shutter, "auto");
 	if(!s_videoMode && s_shutter)
-		sprintf(gain, "%uX", 1u << s_gain);
+		sprintf(gain, "%ux", 1u << s_gain);
 	else
-		strcpy(gain, "AUTO");
+		strcpy(gain, "auto");
 	const char *values[] = {shutter,
 							gain,
 							warmth,
-							!s_videoMode && s_nightBurst ? "ON" : "OFF",
-							s_camera == CAM_OUTER && s_rearLight ? "ON" : "OFF",
-							s_timestamp ? "ON" : "OFF",
-							""};
+							!s_videoMode && s_nightBurst ? "on" : "off",
+							s_camera == CAM_OUTER && s_rearLight ? "on" : "off",
+							s_timestamp ? "on" : "off",
+							"A"};
 	for(int i = 0; i < ADV_COUNT; i++) {
 		int y        = ADV_ROW_Y + i * ADV_ROW_H;
 		bool enabled = advancedRowEnabled(i);
 		bool active  = enabled && i == selected;
-		uiRect(12, y, 232, ADV_ROW_H, active ? UI_PANEL : UI_BG);
 		if(active)
-			uiRect(12, y + 3, 2, 11, UI_ACCENT);
-		uiText(22, y + 5, labels[i], !enabled ? UI_DIM : active ? UI_ACCENT : UI_FG);
-		uiText(222 - strlen(values[i]) * 6, y + 5, values[i], enabled ? UI_FG : UI_DIM);
-		if(enabled && i != ADV_RESET) {
-			uiText(138, y + 5, "<", UI_DIM);
-			uiText(234, y + 5, ">", UI_DIM);
-		}
+			uiText(6, y + 2, ">", UI_FG);
+		uiText(18, y + 2, labels[i], enabled ? UI_FG : UI_DISABLED);
+		uiText(238 - uiTextWidth(values[i], &ui_font_11),
+			   y + 2,
+			   values[i],
+			   !enabled     ? UI_DISABLED
+				   : active ? UI_FG
+							: UI_DIM);
 	}
-	uiTextCenter(159, "UP/DOWN SELECT  < > ADJUST", UI_DIM);
-	uiTextCenter(171, s_videoMode ? "A: SET   B/X: DONE" : "A: SET  L/R: PHOTO  B/X: DONE", UI_DIM);
-	const char *hints[] = {"A: AUTO - MANUAL UNLOCKS GAIN",
-						   "HIGHER GAIN ADDS NOISE",
-						   "A: AUTO  < COOL / WARM >",
-						   "4 FRAMES - REAR LIGHT OFF",
-						   "OFF WHILE NIGHT BURST SHOOTS",
-						   "BURN DATE AND TIME INTO IMAGE",
-						   "A: RESET ALL SETTINGS"};
-	uiStatus(hints[selected]);
+	const char *hints[] = {"A for Auto. Manual unlocks gain.",
+						   "Higher gain adds noise.",
+						   "A for Auto. Left cools, right warms.",
+						   "Four frames. Keep the camera still.",
+						   "Off during Night Burst captures.",
+						   "Add date and time to saved images.",
+						   "A to restore default settings."};
+	uiStatus(s_videoMode && !advancedRowEnabled(selected) ? "Photo controls unavailable in video." : hints[selected]);
 }
 
 static void uiExposureFailure(unsigned lines, unsigned gain) {
@@ -1431,13 +1492,15 @@ static bool advancedMenu(u16 *gfx) {
 		if(keysDown() & KEY_TOUCH) {
 			touchPosition touch;
 			touchRead(&touch);
+			if(touch.px >= 170 && touch.py < 35)
+				break;
 			if(touch.py >= ADV_ROW_Y && touch.py < ADV_ROW_Y + ADV_COUNT * ADV_ROW_H) {
 				int row = (touch.py - ADV_ROW_Y) / ADV_ROW_H;
 				if(!advancedRowEnabled(row))
 					continue;
 				selected = row;
 				if(touch.px >= 128) {
-					if(selected == ADV_RESET)
+					if(selected >= ADV_NIGHT)
 						tappedAction = true;
 					else
 						pressed |= touch.px < 180 ? KEY_LEFT : KEY_RIGHT;
@@ -1494,7 +1557,7 @@ static bool advancedMenu(u16 *gfx) {
 		bool changed            = !s_videoMode && (oldShutter != s_shutter || oldGain != s_gain);
 		unsigned attemptedLines = s_shutterLines[s_shutter], attemptedGain = s_gain;
 		if(changed)
-			uiStatus("APPLYING SENSOR SETTINGS...");
+			uiStatus("Applying settings...");
 		bool ok = !changed || cameraSetExposure(attemptedLines, attemptedGain);
 		if(!ok) {
 			s_shutter    = oldShutter;
@@ -1521,10 +1584,11 @@ static bool advancedMenu(u16 *gfx) {
 
 // Centered modal question; waits for A (true) / B (false).
 static bool uiConfirm(const char *msg) {
-	uiRect(27, 63, 202, 58, UI_DIM);
-	uiRect(28, 64, 200, 56, UI_BG);
-	uiTextCenter(78, msg, UI_FG);
-	uiTextCenter(100, "A: YES     B: NO", UI_DIM);
+	uiHeader("delete");
+	uiTextCenter(69, msg, UI_FG);
+	uiSmall(62, 88, "moves to SD trash", UI_DIM);
+	uiSmall(48, 112, "B cancel", UI_DIM);
+	uiSmall(156, 112, "A delete", UI_ALERT);
 	return confirmAB();
 }
 
@@ -1537,7 +1601,7 @@ typedef struct Section {
 // Lays out photos into rows of 4 under per-day headers. Fills px/py (virtual
 // position per photo) and *outSec/*outNsec; returns the total virtual height.
 static int buildLayout(const Photo *ph, int count, int *px, int *py, Section **outSec, int *outNsec) {
-	static const char *mon[12] = {"JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"};
+	static const char *mon[12] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
 	Section *sec               = (Section *)malloc(count * sizeof(Section));
 	int ns = 0, y = 0, i = 0;
 
@@ -1548,7 +1612,7 @@ static int buildLayout(const Photo *ph, int count, int *px, int *py, Section **o
 		if(lt)
 			sprintf(sec[ns].label, "%s %d, %d", mon[lt->tm_mon], lt->tm_mday, 1900 + lt->tm_year);
 		else
-			strcpy(sec[ns].label, "UNKNOWN DATE");
+			strcpy(sec[ns].label, "Unknown date");
 		y += HEADER_H;
 
 		int dk = dayKey(ph[i].ts), col = 0;
@@ -1590,14 +1654,14 @@ static void composeAlbum(u16 *gfx,
 						 int scroll,
 						 int sel,
 						 const bool *marked) {
-	u16 bgCol = BIT(15) | RGB15(3, 3, 4);
+	u16 bgCol = UI_BG;
 	for(int i = 0; i < 256 * SCREEN_H; i++)
 		gfx[i] = bgCol;
 
 	for(int s = 0; s < nsec; s++) {
 		int dy = sec[s].y - scroll;
 		if(dy > -HEADER_H && dy < SCREEN_H)
-			drawText(gfx, 3, dy + 3, sec[s].label, BIT(15) | RGB15(24, 24, 26));
+			uiDrawText(gfx, 6, dy + 3, sec[s].label, UI_FG, &ui_font_11);
 	}
 
 	for(int i = 0; i < count; i++) {
@@ -1624,44 +1688,44 @@ static void composeAlbum(u16 *gfx,
 		}
 	}
 
-	// Marked photos get an orange border.
-	u16 orange = BIT(15) | RGB15(31, 20, 4);
+	// Marked items are bright; other focus borders are muted.
+	u16 markedColor = UI_FG;
 	for(int i = 0; i < count; i++) {
 		if(!marked || !marked[i] || i == sel)
 			continue;
 		int my = py[i] - scroll;
 		if(my <= -THUMB_H || my >= SCREEN_H)
 			continue;
-		hline(gfx, px[i], my, THUMB_W, orange);
-		hline(gfx, px[i], my + 1, THUMB_W, orange);
-		hline(gfx, px[i], my + THUMB_H - 2, THUMB_W, orange);
-		hline(gfx, px[i], my + THUMB_H - 1, THUMB_W, orange);
+		hline(gfx, px[i], my, THUMB_W, markedColor);
+		hline(gfx, px[i], my + 1, THUMB_W, markedColor);
+		hline(gfx, px[i], my + THUMB_H - 2, THUMB_W, markedColor);
+		hline(gfx, px[i], my + THUMB_H - 1, THUMB_W, markedColor);
 		for(int y = 0; y < THUMB_H; y++) {
 			int yy = my + y;
 			if(yy < 0 || yy >= SCREEN_H)
 				continue;
-			gfx[yy * 256 + px[i]]               = orange;
-			gfx[yy * 256 + px[i] + 1]           = orange;
-			gfx[yy * 256 + px[i] + THUMB_W - 2] = orange;
-			gfx[yy * 256 + px[i] + THUMB_W - 1] = orange;
+			gfx[yy * 256 + px[i]]               = markedColor;
+			gfx[yy * 256 + px[i] + 1]           = markedColor;
+			gfx[yy * 256 + px[i] + THUMB_W - 2] = markedColor;
+			gfx[yy * 256 + px[i] + THUMB_W - 1] = markedColor;
 		}
 	}
 
-	// Selection border (orange instead of white when the photo is marked).
-	u16 white = marked && marked[sel] ? orange : (BIT(15) | RGB15(31, 31, 31));
+	// Keep the focused item distinct from marked items.
+	u16 focus = marked && marked[sel] ? markedColor : UI_DIM;
 	int dy    = py[sel] - scroll;
-	hline(gfx, px[sel], dy, THUMB_W, white);
-	hline(gfx, px[sel], dy + 1, THUMB_W, white);
-	hline(gfx, px[sel], dy + THUMB_H - 2, THUMB_W, white);
-	hline(gfx, px[sel], dy + THUMB_H - 1, THUMB_W, white);
+	hline(gfx, px[sel], dy, THUMB_W, focus);
+	hline(gfx, px[sel], dy + 1, THUMB_W, focus);
+	hline(gfx, px[sel], dy + THUMB_H - 2, THUMB_W, focus);
+	hline(gfx, px[sel], dy + THUMB_H - 1, THUMB_W, focus);
 	for(int y = 0; y < THUMB_H; y++) {
 		int yy = dy + y;
 		if(yy < 0 || yy >= SCREEN_H)
 			continue;
-		gfx[yy * 256 + px[sel]]               = white;
-		gfx[yy * 256 + px[sel] + 1]           = white;
-		gfx[yy * 256 + px[sel] + THUMB_W - 2] = white;
-		gfx[yy * 256 + px[sel] + THUMB_W - 1] = white;
+		gfx[yy * 256 + px[sel]]               = focus;
+		gfx[yy * 256 + px[sel] + 1]           = focus;
+		gfx[yy * 256 + px[sel] + THUMB_W - 2] = focus;
+		gfx[yy * 256 + px[sel] + THUMB_W - 1] = focus;
 	}
 }
 
@@ -1728,20 +1792,19 @@ static bool fullView(u16 *gfx, const Photo *ph, int count, int *idx) {
 			if(lt)
 				strftime(when, sizeof(when), "%b %d, %Y  %H:%M", lt);
 			else
-				strcpy(when, "UNKNOWN DATE");
+				strcpy(when, "Unknown date");
 			sprintf(line, "%s_%04d", ph[*idx].isVideo ? "VID" : "IMG", ph[*idx].num);
 			uiHeader(line);
 			uiTextCenter(44, when, UI_DIM);
 			sprintf(line, "%d/%d", *idx + 1, count);
 			uiTextCenter(58, line, UI_DIM);
 			int y = 88;
-			uiKey(y, "< >", "BROWSE");
 			if(ph[*idx].isVideo)
-				uiKey(y += 16, "A", "PLAY");
+				uiKey(y, "A", "play video");
 			else
-				uiKey(y += 16, "A", "SEND TO DSI ALBUM");
-			uiKey(y += 16, "X", "DELETE");
-			uiKey(y += 16, "B", "BACK");
+				uiKey(y, "A", "send to DSi Album");
+			uiKey(y += 20, "X", "delete");
+			uiSmall(16, 146, "left/right browse  B back", UI_DIM);
 			dirty = false;
 		}
 
@@ -1764,12 +1827,12 @@ static bool fullView(u16 *gfx, const Photo *ph, int count, int *idx) {
 				playVideo(gfx, ph[*idx].num);
 				dirty = true; // redraw the still + info afterwards
 			} else {
-				uiStatus("EXPORTING...");
-				uiStatus(exportToAlbum(ph[*idx].num) ? "SENT TO DSI ALBUM" : "EXPORT FAILED");
+				uiStatus("Sending to DSi Album...");
+				uiStatus(exportToAlbum(ph[*idx].num) ? "Sent to DSi Album" : "Could not send photo. Try again.");
 			}
 		} else if(pressed & KEY_X) {
 			char msg[32];
-			sprintf(msg, "DELETE %s_%04d?", ph[*idx].isVideo ? "VID" : "IMG", ph[*idx].num);
+			sprintf(msg, "Delete %s_%04d?", ph[*idx].isVideo ? "VID" : "IMG", ph[*idx].num);
 			if(uiConfirm(msg)) {
 				softDelete(ph[*idx].num, ph[*idx].isVideo);
 				deleted = true;
@@ -1816,8 +1879,8 @@ static void viewer(u16 *gfx, int cam) {
 
 		// Cache every thumbnail in RAM (~6KB each) so scrolling never hits the SD.
 		u16 *thumbs = (u16 *)malloc(count * THUMB_W * THUMB_H * sizeof(u16));
-		uiHeader("ALBUM");
-		uiStatus("LOADING...");
+		uiHeader("album");
+		uiStatus("Loading...");
 		for(int i = 0; i < count; i++)
 			getThumb(ph[i].num, ph[i].isVideo, thumbs + i * THUMB_W * THUMB_H);
 
@@ -1876,9 +1939,9 @@ static void viewer(u16 *gfx, int cam) {
 					nMarked += marked[i];
 				char msg[36];
 				if(nMarked)
-					sprintf(msg, "DELETE %d SELECTED PHOTO%s?", nMarked, nMarked == 1 ? "" : "S");
+					sprintf(msg, "Delete %d selected item%s?", nMarked, nMarked == 1 ? "" : "s");
 				else
-					sprintf(msg, "DELETE IMG_%04d?", ph[sel].num);
+					sprintf(msg, "Delete %s_%04d?", ph[sel].isVideo ? "VID" : "IMG", ph[sel].num);
 				if(uiConfirm(msg)) {
 					if(nMarked) {
 						for(int i = 0; i < count; i++)
@@ -1922,20 +1985,23 @@ static void viewer(u16 *gfx, int cam) {
 				for(int i = 0; i < count; i++)
 					nMarked += marked[i];
 				char line[36];
-				uiHeader("ALBUM");
-				sprintf(line, "IMG_%04d  %d/%d%s", ph[sel].num, sel + 1, count, marked[sel] ? "  *" : "");
+				uiHeader("album");
+				sprintf(line,
+						"%s_%04d  %d/%d%s",
+						ph[sel].isVideo ? "VID" : "IMG",
+						ph[sel].num,
+						sel + 1,
+						count,
+						marked[sel] ? "  *" : "");
 				uiTextCenter(44, line, UI_FG);
 				if(nMarked) {
-					sprintf(line, "%d SELECTED", nMarked);
+					sprintf(line, "%d selected", nMarked);
 					uiTextCenter(58, line, UI_DIM);
 				}
-				int y = 82;
-				uiKey(y, "+", "NAVIGATE");
-				uiKey(y += 16, "L/R", "JUMP DAY");
-				uiKey(y += 16, "A", "VIEW");
-				uiKey(y += 16, "Y", "SELECT");
-				uiKey(y += 16, "X", "DELETE");
-				uiKey(y += 16, "B", "CAMERA");
+				uiKey(88, "A", "open");
+				uiKey(108, "Y", "select");
+				uiKey(128, "X", "delete");
+				uiSmall(16, 146, "d-pad browse  B camera", UI_DIM);
 				infoDirty = false;
 			}
 		}
@@ -1952,7 +2018,7 @@ static void viewer(u16 *gfx, int cam) {
 
 	uiCameraScreen(cam, true);
 	if(empty)
-		uiStatus("NO PHOTOS YET");
+		uiStatus("No photos yet. Press L/R to take one.");
 }
 
 int main(int argc, char **argv) {
@@ -1965,8 +2031,8 @@ int main(int argc, char **argv) {
 	u16 *gfx    = bgGetGfxPtr(bg3Main);
 	s_subGfx    = bgGetGfxPtr(bg3Sub);
 
-	uiHeader("CAMERA");
-	uiStatus("BOOTING...");
+	uiHeader("Camera");
+	uiStatus("Starting camera...");
 
 	bool fatInited = fatInitDefault();
 	if(fatInited) {
@@ -2010,10 +2076,10 @@ int main(int argc, char **argv) {
 			closedir(vdir);
 		}
 	} else {
-		uiStatus("NO SD CARD");
+		uiStatus("Insert an SD card to save");
 	}
 
-	uiStatus("INITIALIZING...");
+	uiStatus("Connecting camera...");
 	pxiWaitRemote(PXI_CAMERA); // Wait for ARM7 to initialize PXI
 	cameraInit();
 	cameraSetRearLight(s_rearLight);
@@ -2076,6 +2142,11 @@ int main(int argc, char **argv) {
 					memcpy(gfx, frame, VID_FRAME_SIZE);
 			}
 			pressed = keysDown();
+			if(pressed & KEY_TOUCH) {
+				touchPosition touch;
+				touchRead(&touch);
+				pressed |= uiCameraTap(touch.px, touch.py, fatInited);
+			}
 		} while(!pressed);
 
 		if(pressed & KEY_A) {
@@ -2114,7 +2185,6 @@ int main(int argc, char **argv) {
 				streamStart();            // recordVideo left the camera idle
 			} else {
 				takePhotos(gfx);
-				uiSpace(); // refresh the free-space line after the burst
 			}
 		} else if(fatInited && pressed & KEY_SELECT) {
 			// Stop the live preview and browse photos.
