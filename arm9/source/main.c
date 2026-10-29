@@ -1287,7 +1287,7 @@ static void uiDrawText(u16 *gfx, int x, int y, const char *s, u16 col, const UiF
 	for(; *s && x < 256; s++) {
 		unsigned c       = (unsigned char)*s;
 		const UiGlyph *g = &font->glyphs[(c >= 32 && c <= 126 ? c : '?') - 32];
-		int stride       = (g->width + 3) / 4;
+		int stride       = (g->width + 7) / 8;
 		for(int cy = 0; cy < font->height; cy++) {
 			int yy = y + cy;
 			if(yy < 0 || yy >= SCREEN_H)
@@ -1296,14 +1296,8 @@ static void uiDrawText(u16 *gfx, int x, int y, const char *s, u16 col, const UiF
 				int xx = x + cx;
 				if(xx < 0 || xx >= 256)
 					continue;
-				unsigned a = (font->pixels[g->offset + cy * stride + cx / 4] >> (cx % 4 * 2)) & 3;
-				if(!a)
-					continue;
-				u16 bg             = gfx[yy * 256 + xx];
-				unsigned r         = ((col & 31) * a + (bg & 31) * (3 - a)) / 3;
-				unsigned green     = (((col >> 5) & 31) * a + ((bg >> 5) & 31) * (3 - a)) / 3;
-				unsigned b         = (((col >> 10) & 31) * a + ((bg >> 10) & 31) * (3 - a)) / 3;
-				gfx[yy * 256 + xx] = BIT(15) | RGB15(r, green, b);
+				if(font->pixels[g->offset + cy * stride + cx / 8] & BIT(cx % 8))
+					gfx[yy * 256 + xx] = col;
 			}
 		}
 		x += g->advance;
@@ -1471,7 +1465,8 @@ static void uiExposureFailure(unsigned lines, unsigned gain) {
 static bool advancedMenu(u16 *gfx) {
 	bool exitRequested = false;
 	int selected       = s_videoMode ? ADV_TIMESTAMP : ADV_SHUTTER;
-	keysSetRepeat(18, 6);
+	bool dirty         = false;
+	keysSetRepeat(14, 4);
 	uiAdvancedScreen(selected);
 	while(!pmShouldReset()) {
 		swiWaitForVBlank();
@@ -1480,14 +1475,14 @@ static bool advancedMenu(u16 *gfx) {
 			lidSleep();
 			continue;
 		}
-		u16 *frame = cameraNextFrame();
+		u16 pressed = keysDownRepeat();
+		u16 *frame  = pressed ? NULL : cameraNextFrame();
 		if(frame) {
 			if(!s_videoMode && s_warmth)
 				whiteBalancePreview(frame, gfx, VID_W * VID_H, s_warmth);
 			else
 				memcpy(gfx, frame, VID_FRAME_SIZE);
 		}
-		u16 pressed       = keysDownRepeat();
 		bool tappedAction = false;
 		if(keysDown() & KEY_TOUCH) {
 			touchPosition touch;
@@ -1556,6 +1551,7 @@ static bool advancedMenu(u16 *gfx) {
 		}
 		bool changed            = !s_videoMode && (oldShutter != s_shutter || oldGain != s_gain);
 		unsigned attemptedLines = s_shutterLines[s_shutter], attemptedGain = s_gain;
+		uiAdvancedScreen(selected);
 		if(changed)
 			uiStatus("Applying settings...");
 		bool ok = !changed || cameraSetExposure(attemptedLines, attemptedGain);
@@ -1572,13 +1568,17 @@ static bool advancedMenu(u16 *gfx) {
 			s_rearLight = oldRearLight;
 			cameraSetRearLight(s_rearLight);
 		}
-		uiAdvancedScreen(selected);
+		dirty |= oldShutter != s_shutter || oldGain != s_gain || oldWarmth != s_warmth || oldNight != s_nightBurst ||
+			oldTimestamp != s_timestamp || oldRearLight != s_rearLight;
+		if(changed || !lightOk)
+			uiAdvancedScreen(selected);
 		if(!ok)
 			uiExposureFailure(attemptedLines, attemptedGain);
 		else if(!lightOk)
 			uiStatus("REAR LIGHT SETTING FAILED");
 	}
-	cfgSave();
+	if(dirty)
+		cfgSave();
 	return exitRequested;
 }
 
@@ -2115,6 +2115,7 @@ int main(int argc, char **argv) {
 	if(!exposureReady)
 		uiStatus("SAVED EXPOSURE SETTING FAILED");
 	streamStart(); // continuous viewfinder
+	scanKeys();    // buttons held over from the launcher aren't new presses
 
 	while(1) {
 		u16 pressed = 0;
@@ -2134,14 +2135,14 @@ int main(int argc, char **argv) {
 				continue;
 			}
 			// Blit whatever the camera has produced since the last vblank.
-			u16 *frame = cameraNextFrame();
+			pressed    = keysDown();
+			u16 *frame = pressed ? NULL : cameraNextFrame();
 			if(frame) {
 				if(!s_videoMode && s_warmth)
 					whiteBalancePreview(frame, gfx, VID_W * VID_H, s_warmth);
 				else
 					memcpy(gfx, frame, VID_FRAME_SIZE);
 			}
-			pressed = keysDown();
 			if(pressed & KEY_TOUCH) {
 				touchPosition touch;
 				touchRead(&touch);
@@ -2157,15 +2158,16 @@ int main(int argc, char **argv) {
 			uiCameraScreen(camera, fatInited);
 			streamStart();
 		} else if(fatInited && pressed & KEY_Y) {
-			bool video = !s_videoMode;
+			bool video  = !s_videoMode;
+			s_videoMode = video;
+			uiCameraScreen(camera, fatInited);
 			if(!cameraSetExposure(video ? 0 : s_shutterLines[s_shutter], s_gain)) {
+				s_videoMode = !video;
+				uiCameraScreen(camera, fatInited);
 				uiExposureFailure(video ? 0 : s_shutterLines[s_shutter], s_gain);
 				continue;
 			}
-			s_videoMode = video;
-			uiCameraScreen(camera, fatInited);
 		} else if(fatInited && pressed & KEY_X) {
-			drainJobs();
 			if(advancedMenu(gfx)) {
 				cameraDeactivate(camera);
 				drainJobs();

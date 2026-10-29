@@ -1,4 +1,4 @@
-"""Generate the IBM Plex Mono bitmap subset (requires Pillow)."""
+"""Generate the monochrome IBM Plex Mono bitmap subset (requires Pillow)."""
 import argparse
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
@@ -23,13 +23,15 @@ for size in (10, 11):
     for code in range(32, 127):
         width, height = advance, size + 4
         im = Image.new('L', (width, height))
-        ImageDraw.Draw(im).text((0, size), chr(code), font=font, fill=255, anchor='ls')
+        draw = ImageDraw.Draw(im)
+        draw.fontmode = '1'
+        draw.text((0, size), chr(code), font=font, fill=255, anchor='ls')
         glyphs.append((len(data), width, advance))
         for y in range(height):
-            for x in range(0, width, 4):
+            for x in range(0, width, 8):
                 data.append(sum(
-                    round(im.getpixel((xx, y)) * 3 / 255) << ((xx - x) * 2)
-                    for xx in range(x, min(x + 4, width))
+                    (im.getpixel((xx, y)) != 0) << (xx - x)
+                    for xx in range(x, min(x + 8, width))
                 ))
     out.append(f'static const UiGlyph ui_glyphs_{size}[] = {{')
     out.extend('    {%d, %d, %d},' % g for g in glyphs)

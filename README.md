@@ -54,7 +54,9 @@ clean.
 
 ## UI preview
 
-The interface uses a black background and small IBM Plex Mono bitmap text.
+The interface uses a black background and small, pixel-aligned IBM Plex Mono
+bitmap text without antialiasing. Controls open while photo saves finish in the
+background; unchanged exposure settings keep the preview stream running.
 The font is licensed under the SIL Open Font License; see `tools/ui/OFL-IBMPlexMono.txt`.
 The bitmap subset is compiled into the app and needs no font files on the SD card.
 

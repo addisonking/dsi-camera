@@ -35,6 +35,12 @@ typedef uint64_t u64;
 typedef int Camera;
 #define KEY_A (1 << 0)
 #define KEY_B (1 << 1)
+#define KEY_START (1 << 3)
+#define KEY_RIGHT (1 << 4)
+#define KEY_LEFT (1 << 5)
+#define KEY_UP (1 << 6)
+#define KEY_DOWN (1 << 7)
+#define KEY_R (1 << 8)
 #define KEY_LID (1 << 12)
 #define KEY_TOUCH (1 << 14)
 #define KEY_SELECT (1 << 2)
@@ -70,6 +76,8 @@ static void scanKeys(void) {
     currentEvent = events[eventIndex++];
 }
 static u16 keysDown(void) { return currentEvent.pressed; }
+static u16 keysDownRepeat(void) { return currentEvent.pressed; }
+static void keysSetRepeat(int delay, int repeat) { assert(delay == 14 && repeat == 4); }
 static u16 keysHeld(void) { return currentEvent.held; }
 static bool pmShouldReset(void) { return currentEvent.reset; }
 static void touchRead(touchPosition *touch) {
@@ -93,9 +101,94 @@ code += section('typedef struct Photo {', 'static int cmpPhoto')
 code += section('static int dayKey(', '// Async save pipeline')
 code += section('static const u8 s_font', '// --- Timestamp watermark:')
 code += section('// --- Bottom-screen UI,', 'static void uiExposureFailure')
+code += r'''
+#define VID_W 256
+#define VID_H 192
+#define VID_FRAME_SIZE (VID_W * VID_H * 2)
+static unsigned exposureCalls, lightCalls, previewCalls, configWrites, exposureFailures;
+static bool failExposure, failLight;
+static u16 expectedFeedback[256 * SCREEN_H];
+static u16 *cameraNextFrame(void) { previewCalls++; return NULL; }
+static void whiteBalancePreview(const u16 *src, u16 *dst, unsigned pixels, int warmth) {
+    (void)src; (void)dst; (void)pixels; (void)warmth; assert(false);
+}
+static void lidSleep(void) { assert(false); }
+static void takePhotos(u16 *gfx) { (void)gfx; assert(false); }
+static void cfgSave(void) { configWrites++; }
+static bool cameraSetExposure(unsigned lines, unsigned gain) {
+    assert(lines == 1 && gain == 0);
+    // Feedback must already be visible when the blocking sensor call begins.
+    assert(memcmp(canvas, expectedFeedback, sizeof(canvas)) == 0);
+    exposureCalls++;
+    return !failExposure;
+}
+static bool cameraSetRearLight(bool enabled) { (void)enabled; lightCalls++; return !failLight; }
+static void uiExposureFailure(unsigned lines, unsigned gain) {
+    (void)lines; (void)gain; exposureFailures++;
+}
+'''
+code += section('static bool advancedMenu(', '// Centered modal question;')
 code += section('// Waits for A (true)', '// Loads (or builds')
 code += section('static bool uiConfirm(', '// Moves the selection')
 code += r'''
+static void testMenu(void) {
+    const InputEvent browse[] = {{.pressed=KEY_DOWN}, {.pressed=KEY_B}};
+    input(browse, 2);
+    assert(!advancedMenu(canvas));
+    assert(!configWrites && !exposureCalls && !previewCalls);
+
+    const InputEvent timestamp[] = {
+        {.pressed=KEY_TOUCH, .x=220, .y=ADV_ROW_Y+ADV_TIMESTAMP*ADV_ROW_H+8},
+        {.pressed=KEY_B}
+    };
+    input(timestamp, 2);
+    assert(!advancedMenu(canvas));
+    assert(s_timestamp && configWrites == 1 && !exposureCalls && !previewCalls);
+    s_timestamp = false;
+    configWrites = 0;
+
+    s_shutter = 1;
+    uiAdvancedScreen(ADV_SHUTTER); uiStatus("Applying settings...");
+    memcpy(expectedFeedback, canvas, sizeof(canvas));
+    s_shutter = 0;
+    const InputEvent shutter[] = {{.pressed=KEY_RIGHT}, {.pressed=KEY_B}};
+    input(shutter, 2);
+    assert(!advancedMenu(canvas));
+    assert(s_shutter == 1 && exposureCalls == 1 && configWrites == 1 && !previewCalls);
+
+    s_shutter = 0; failExposure = true; configWrites = 0;
+    input(shutter, 2);
+    assert(!advancedMenu(canvas));
+    assert(s_shutter == 0 && exposureCalls == 2 && exposureFailures == 1 && !configWrites);
+    failExposure = false;
+
+    failLight = true;
+    const InputEvent light[] = {
+        {.pressed=KEY_TOUCH, .x=220, .y=ADV_ROW_Y+ADV_REAR_LIGHT*ADV_ROW_H+8},
+        {.pressed=KEY_B}
+    };
+    input(light, 2);
+    assert(!advancedMenu(canvas));
+    assert(s_rearLight && lightCalls == 2 && !configWrites);
+    failLight = false;
+
+    const InputEvent idle[] = {{0}, {.pressed=KEY_B}};
+    input(idle, 2);
+    assert(!advancedMenu(canvas));
+    assert(previewCalls == 1 && !configWrites);
+}
+static void testFont(void) {
+    const UiFont *fonts[] = {&ui_font_10, &ui_font_11};
+    for(unsigned f = 0; f < 2; f++) {
+        for(int c = 32; c <= 126; c++) {
+            char text[] = {(char)c, '\0'};
+            uiHeader("");
+            uiDrawText(canvas, 20, 20, text, UI_FG, fonts[f]);
+            for(unsigned i = 0; i < 256 * SCREEN_H; i++)
+                assert(canvas[i] == UI_BG || canvas[i] == UI_FG);
+        }
+    }
+}
 static void expectConfirm(const InputEvent *script, size_t count, bool result) {
     input(script, count);
     assert(confirmAB() == result);
@@ -141,6 +234,8 @@ static void expectStatus(const char *message, const char *first, const char *sec
 }
 int main(void) {
     s_subGfx = canvas; s_camera = CAM_OUTER;
+    testMenu();
+    testFont();
     testInput();
     expectStatus("saved", "", "saved");
     expectStatus("VID_0001 10.0FPS D:120 A:0 O:1000 G:12.4s",
@@ -239,4 +334,4 @@ for i, (name, label) in enumerate(shots):
     with Image.open(OUT / (name+'.png')) as im:
         board.paste(im, (x,y+20))
 board.resize((board.width*2,board.height*2), Image.Resampling.NEAREST).save(OUT/'overview.png')
-print(f'Rendered UI states, confirmation input, burst cancellation, full diagnostics, clipping and album scroll checks passed: {OUT}')
+print(f'Rendered UI states, menu feedback/rollback, monochrome glyphs, confirmation input, burst cancellation, full diagnostics, clipping and album scroll checks passed: {OUT}')
